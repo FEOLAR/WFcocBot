@@ -1,4 +1,4 @@
-TELEGRAM_BOT_TOKEN = "вставь_сюда_токен_бота"
+TELEGRAM_BOT_TOKEN = "8690157836:AAFXrVdynsp_fueHyln2-29T2qtoNNaw1Xw"
 
 # ── Вариант 1 (рекомендуемый): прямой API ключ ────────────────────────────────
 # Зарегистрируй ключ на https://developer.clashofclans.com
@@ -8,8 +8,8 @@ COC_API_KEY = ""
 
 # ── Вариант 2 (резервный): вход через email/пароль ────────────────────────────
 # Используется только если COC_API_KEY пустой
-COC_EMAIL    = ""
-COC_PASSWORD = ""
+COC_EMAIL    = "shartol3002@gmail.com"
+COC_PASSWORD = "NJKZtujh3002"
 
 # ── Прокси (необязательно) ────────────────────────────────────────────────────
 # Если запускаешь бота не на Replit и нет статического IP:
