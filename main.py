@@ -90,8 +90,33 @@ ROLE_ORDER = {
 
 
 def _norm_name(name: str) -> str:
+    """NFC + lowercase + удаляем невидимые/форматирующие Unicode символы.
+
+    CoC и Telegram могут по-разному хранить невидимые символы в никах:
+    монгольские вариационные селекторы (U+180B-U+180F), variation selectors
+    (U+FE00-U+FE0F), нулевые пробелы (U+200B-U+200F), BOM и т.п.
+    Фильтруем точечно, чтобы не затронуть реальные диакритики (ā, ŕ, ķ...).
+    """
     import unicodedata as _ud
-    return _ud.normalize("NFC", name).lower()
+    # Диапазоны полностью невидимых символов
+    _INVIS = [
+        (0x180B, 0x180F),   # Mongolian Free Variation Selectors
+        (0xFE00, 0xFE0F),   # Variation Selectors VS1-VS16
+        (0xE0100, 0xE01EF), # Variation Selectors Supplement
+        (0x200B, 0x200F),   # Zero-width space, ZWNJ, ZWJ, LRM, RLM
+        (0x2060, 0x2064),   # Word joiner and invisible operators
+        (0xFEFF, 0xFEFF),   # BOM / ZWNBSP
+        (0x00AD, 0x00AD),   # Soft hyphen
+    ]
+    def _is_invis(ch: str) -> bool:
+        cat = _ud.category(ch)
+        if cat in ("Cf", "Cc"):
+            return True
+        cp = ord(ch)
+        return any(s <= cp <= e for s, e in _INVIS)
+
+    normalized = _ud.normalize("NFC", name)
+    return "".join(ch for ch in normalized if not _is_invis(ch)).lower()
 
 coc_client = coc.Client()
 

@@ -6,9 +6,32 @@ from datetime import datetime
 import pathlib
 
 
+_INVIS_RANGES = [
+    (0x180B, 0x180F),   # Mongolian Free Variation Selectors
+    (0xFE00, 0xFE0F),   # Variation Selectors VS1-VS16
+    (0xE0100, 0xE01EF), # Variation Selectors Supplement
+    (0x200B, 0x200F),   # Zero-width space, ZWNJ, ZWJ, LRM, RLM
+    (0x2060, 0x2064),   # Word joiner and invisible operators
+    (0xFEFF, 0xFEFF),   # BOM / ZWNBSP
+    (0x00AD, 0x00AD),   # Soft hyphen
+]
+
+
+def _is_invis(ch: str) -> bool:
+    if unicodedata.category(ch) in ("Cf", "Cc"):
+        return True
+    cp = ord(ch)
+    return any(s <= cp <= e for s, e in _INVIS_RANGES)
+
+
 def _norm(name: str) -> str:
-    """Unicode NFC normalization + lowercase для надёжного сравнения никнеймов."""
-    return unicodedata.normalize("NFC", name).lower()
+    """NFC + lowercase + удаляем невидимые/форматирующие Unicode символы.
+
+    Точечно убираем variation selectors (U+180B-U+180F, U+FE00-U+FE0F),
+    нулевые пробелы и Cf/Cc символы, не трогая реальные диакритики (ā, ŕ, ķ...).
+    """
+    normalized = unicodedata.normalize("NFC", name)
+    return "".join(ch for ch in normalized if not _is_invis(ch)).lower()
 
 def _data_dir() -> pathlib.Path:
     p = pathlib.Path("/data")
