@@ -194,9 +194,12 @@ async def team_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not members:
                 continue
             key, label = role_titles[role]
-            count = f": {len(members)}" if role != "leader" else ""
+            count = f" {len(members)}" if role != "leader" else ""
+            # у пака есть значки-плашки «Глава», «Соруки», «Старик» — тогда текст не дублируем
+            head = (f"{e(key)}<b>{count}</b>" if game_emoji.icon_id(key)
+                    else f"{e(key)} <b>{label}{':' + count if count else ''}</b>")
             rows = [fmt.player(m.name, m.town_hall, tg_map.get(_norm_name(m.name))) for m in members]
-            lines.append(f"\n{e(key)} <b>{label}{count}</b>\n{quote(rows, fold_after=15)}")
+            lines.append(f"\n{head}\n{quote(rows, fold_after=15)}")
         await fmt.edit(msg, "\n".join(lines), reply_markup=fmt.clan_buttons())
     except coc.NotFound:
         await fmt.edit(msg, fmt.err(f"Клан {CLAN_TAG} не найден. Проверь CLAN_TAG в .env."))
@@ -688,11 +691,16 @@ async def card_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buf = await card_builder.build_card(clan, raids=raids,
                                             background_path=random.choice(available) if available else None)
         caption = "\n".join([
-            f"{game_emoji.plain('clan')} <b>{esc(clan.name)}</b>, уровень {clan.level}",
-            f"{game_emoji.plain('team')} {clan.member_count} в составе",
-            f"{game_emoji.plain('war')} Побед {clan.war_wins}, поражений {clan.war_losses}",
+            f"{e('clan')} <b>{esc(clan.name)}</b>, уровень {clan.level}",
+            f"{e('site')} {config.CLAN_WEBSITE.replace('https://', '')}",
         ])
-        await update.message.reply_photo(photo=buf, caption=caption, parse_mode="HTML")
+        try:
+            await update.message.reply_photo(photo=buf, caption=caption, parse_mode="HTML",
+                                             reply_markup=fmt.clan_buttons())
+        except Exception:
+            buf.seek(0)
+            await update.message.reply_photo(photo=buf, caption=game_emoji.strip_custom(caption),
+                                             parse_mode="HTML")
         await msg.delete()
     except Exception as exc:
         logger.error(f"/card: {exc}", exc_info=True)
@@ -814,9 +822,12 @@ async def emojipack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await fmt.reply(update.message, fmt.err(f"Пак <code>{esc(name)}</code> не найден: {esc(exc)}"))
         return
     game_emoji.remember_pack(pack.stickers)
-    found = game_emoji.auto_map_stickers(pack.stickers, overwrite=True)
+    preset = game_emoji.apply_pack_defaults(pack.name, pack.stickers)
+    found = {} if preset else game_emoji.auto_map_stickers(pack.stickers, overwrite=True)
     if found:
         game_emoji.set_many(found)
+    if preset:
+        found = {k: v for k, v in game_emoji.mapped().items()}
     missing = [k for k in game_emoji.KEYS if k not in game_emoji.mapped()]
     lines = [
         fmt.ok(f"Пак <b>{esc(pack.title)}</b>: {len(pack.stickers)} эмодзи, сопоставлено {len(found)}"),
@@ -857,7 +868,7 @@ async def setemoji_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not pairs:
         await fmt.reply(msg, "Пример: <code>/setemoji war 12 star 3</code> — номера из /emojilist")
         return
-    game_emoji.set_many(pairs)
+    game_emoji.set_many(pairs, manual=True)
     await fmt.reply(msg, fmt.ok("Сохранил: " + "  ".join(f"{e(k)} <code>{k}</code>" for k in pairs)))
 
 
@@ -866,7 +877,13 @@ async def emojireset_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _deny(update)
         return
     game_emoji.reset()
-    await fmt.reply(update.message, fmt.ok("Вернул обычные эмодзи."))
+    if context.args and context.args[0].lower() in ("pack", "пак") and game_emoji.pack_ids:
+        from types import SimpleNamespace
+        n = game_emoji.apply_pack_defaults(config.EMOJI_PACK,
+                                           [SimpleNamespace(custom_emoji_id=i) for i in game_emoji.pack_ids])
+        await fmt.reply(update.message, fmt.ok(f"Вернул раскладку пака: {n} значков."))
+        return
+    await fmt.reply(update.message, fmt.ok("Вернул обычные эмодзи. Раскладка пака: /emojireset pack"))
 
 
 async def emojilist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -946,10 +963,13 @@ async def post_init(application):
         try:
             pack = await application.bot.get_sticker_set(game_emoji.pack_name_from(config.EMOJI_PACK))
             game_emoji.remember_pack(pack.stickers)
-            found = game_emoji.auto_map_stickers(pack.stickers) if not game_emoji.mapped() else {}
-            if found:
-                game_emoji.set_many(found)
-            logger.info(f"Эмодзи-пак {pack.name}: {len(pack.stickers)} шт., сопоставлено {len(found)}")
+            n = game_emoji.apply_pack_defaults(pack.name, pack.stickers)
+            if not n and not game_emoji.mapped():
+                found = game_emoji.auto_map_stickers(pack.stickers)
+                if found:
+                    game_emoji.set_many(found)
+                n = len(found)
+            logger.info(f"Эмодзи-пак {pack.name}: {len(pack.stickers)} шт., привязано {n}")
         except Exception as exc:
             logger.warning(f"Эмодзи-пак {config.EMOJI_PACK}: {exc}")
 
