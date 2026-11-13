@@ -33,17 +33,62 @@ def _norm(name: str) -> str:
     normalized = unicodedata.normalize("NFC", name)
     return "".join(ch for ch in normalized if not _is_invis(ch)).lower()
 
+def _merge_chat_files(paths) -> list:
+    merged = []
+    for p in paths:
+        try:
+            d = json.loads(pathlib.Path(p).read_text(encoding="utf-8") or "{}")
+            merged += d.get("chat_ids", []) or ([d["chat_id"]] if d.get("chat_id") else [])
+        except Exception:
+            pass
+    return list(dict.fromkeys(merged))
+
+
 def _data_dir() -> pathlib.Path:
-    p = pathlib.Path("/data")
+    """Где бот хранит данные.
+
+    1. DATA_DIR из настроек, если задан.
+    2. /data, если это подключённый постоянный диск (volume) — на хостинге
+       он переживает пересборку контейнера.
+    3. Иначе data/ рядом с ботом.
+
+    Раньше бот брал /data всегда, когда туда можно писать. В Docker-контейнере
+    под root это обычная пустая папка, которая обнуляется при каждой
+    пересборке: список чатов рассылки пропадал, и уведомления молча
+    переставали уходить. Теперь в выбранную папку при старте докладываются
+    файлы из data/ репозитория, которых там нет, а чаты рассылки объединяются.
+    """
+    import shutil
     try:
-        p.mkdir(exist_ok=True)
-        (p / ".writable_check").touch()
-        (p / ".writable_check").unlink()
-        return p
-    except OSError:
-        local = pathlib.Path("data")
-        local.mkdir(exist_ok=True)
-        return local
+        import settings as _cfg
+        custom = getattr(_cfg, "DATA_DIR", "")
+    except ImportError:
+        custom = os.environ.get("DATA_DIR", "")
+    repo = pathlib.Path(__file__).resolve().parent / "data"
+    legacy = pathlib.Path("/data")
+
+    if custom:
+        target = pathlib.Path(custom)
+    elif legacy.is_dir() and os.path.ismount(legacy) and os.access(legacy, os.W_OK):
+        target = legacy
+    else:
+        target = repo
+    target.mkdir(parents=True, exist_ok=True)
+
+    sources = [p for p in (repo, legacy) if p.is_dir() and p.resolve() != target.resolve()]
+    for src_dir in sources:
+        for src in src_dir.glob("*.json"):
+            dst = target / src.name
+            try:
+                if src.name == "notify_chat.json":
+                    chats = _merge_chat_files([dst, src])
+                    dst.write_text(json.dumps({"chat_ids": chats}), encoding="utf-8")
+                elif not dst.exists() or dst.stat().st_size == 0:
+                    shutil.copy2(src, dst)
+            except OSError:
+                pass
+    return target
+
 
 _DIR = _data_dir()
 
@@ -169,8 +214,11 @@ def get_tg_username_map() -> dict[str, str]:
 def _load_notify_chats() -> list[int]:
     if not os.path.exists(NOTIFY_CHAT_FILE):
         return []
-    with open(NOTIFY_CHAT_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(NOTIFY_CHAT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
     # Backward compat: old format was {"chat_id": 123}
     if "chat_ids" in data:
         return data["chat_ids"]
@@ -277,3 +325,51 @@ def get_raid_state() -> dict:
             return json.load(f)
     except (json.JSONDecodeError, KeyError):
         return {}
+
+
+def replace_notify_chat(old_id: int, new_id: int):
+    """Группа стала супергруппой — у неё новый ID. Подменяем в списке."""
+    chats = _load_notify_chats()
+    chats = [new_id if c == old_id else c for c in chats]
+    _save_notify_chats(list(dict.fromkeys(chats)))
+
+
+DATA_DIR = str(_DIR)
+
+
+# ── Состояние уведомлений (что уже отправлено) ───────────────────────────────
+NOTIFY_STATE_FILE = str(_DIR / "notify_state.json")
+
+
+def load_notify_state() -> dict:
+    try:
+        with open(NOTIFY_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_notify_state(state: dict):
+    tmp = NOTIFY_STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, NOTIFY_STATE_FILE)
+
+
+# ── Кастомные эмодзи ─────────────────────────────────────────────────────────
+EMOJI_FILE = str(_DIR / "emoji.json")
+
+
+def load_emoji_map() -> dict:
+    try:
+        with open(EMOJI_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_emoji_map(data: dict):
+    with open(EMOJI_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)

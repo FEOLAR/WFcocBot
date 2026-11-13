@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+data/notify_state.json
+data/notify_state.json.tmp
+data/emoji.json
+data/known_ips.json
+data/cwl_state.json
+data/.writable_check

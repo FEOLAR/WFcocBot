@@ -5,7 +5,8 @@ from datetime import datetime
 from collections import Counter
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-FONT_PATH = "fonts/Nunito-Regular.ttf"
+import os as _os
+FONT_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "fonts", "Nunito-Regular.ttf")
 
 W, H = 1280, 720
 
