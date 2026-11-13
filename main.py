@@ -137,7 +137,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/links — все привязки",
             "/addchat, /removechat, /listchats — чаты для уведомлений",
             "/status — проверить, работают ли уведомления",
-            "/emoji, /emojipack, /setemoji — игровые эмодзи",
+            "/emoji, /emojilist, /setemoji — игровые эмодзи",
+            "/avatar — аватарка бота из значка клана",
         ], fold_after=20),
     ])
     await fmt.reply(update.message, text)
@@ -812,6 +813,7 @@ async def emojipack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as exc:
         await fmt.reply(update.message, fmt.err(f"Пак <code>{esc(name)}</code> не найден: {esc(exc)}"))
         return
+    game_emoji.remember_pack(pack.stickers)
     found = game_emoji.auto_map_stickers(pack.stickers, overwrite=True)
     if found:
         game_emoji.set_many(found)
@@ -848,12 +850,12 @@ async def setemoji_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if key:
             pairs[key] = ent.custom_emoji_id
         pos = ent.offset + ent.length
+    words = _args(update).split()
+    for key, val in zip(words[::2], words[1::2]):
+        if key.lower() in game_emoji.KEYS and val.isdigit() and 1 <= int(val) <= len(game_emoji.pack_ids):
+            pairs[key.lower()] = game_emoji.pack_ids[int(val) - 1]
     if not pairs:
-        await fmt.reply(msg, "\n".join([
-            "Не нашёл пар «ключ + кастомный эмодзи».",
-            "Пример: <code>/setemoji war</code> ⚔️ <code>star</code> ⭐ — эмодзи вставь из пака.",
-            "Список ключей — /emoji",
-        ]))
+        await fmt.reply(msg, "Пример: <code>/setemoji war 12 star 3</code> — номера из /emojilist")
         return
     game_emoji.set_many(pairs)
     await fmt.reply(msg, fmt.ok("Сохранил: " + "  ".join(f"{e(k)} <code>{k}</code>" for k in pairs)))
@@ -865,6 +867,60 @@ async def emojireset_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     game_emoji.reset()
     await fmt.reply(update.message, fmt.ok("Вернул обычные эмодзи."))
+
+
+async def emojilist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Каталог пака с номерами — чтобы привязывать значки командой /setemoji war 12."""
+    if not _is_feolar(update):
+        await _deny(update)
+        return
+    if not game_emoji.pack_ids:
+        await fmt.reply(update.message, "Пак ещё не загружен: <code>/emojipack https://t.me/addemoji/Clashpakking</code>")
+        return
+    rows, line_ = [], []
+    for i in range(1, len(game_emoji.pack_ids) + 1):
+        line_.append(f"{i}{game_emoji.pack_emoji(i)}")
+        if len(line_) == 6:
+            rows.append("  ".join(line_))
+            line_ = []
+    if line_:
+        rows.append("  ".join(line_))
+    head = title("admin", f"Эмодзи пака: {len(game_emoji.pack_ids)}")
+    tail = "Привязать: <code>/setemoji war 12 star 3 capital 7</code>\nКлючи и текущие значки — /emoji"
+    chunk = []
+    for r in rows:
+        chunk.append(r)
+        if len(chunk) == 15:   # в одном сообщении не больше 100 кастомных эмодзи
+            await fmt.reply(update.message, head + "\n" + "\n".join(chunk))
+            head, chunk = "", []
+    await fmt.reply(update.message, (head + "\n" if head else "") + "\n".join(chunk) + "\n\n" + tail)
+
+
+async def avatar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/avatar — прислать аватарку в стиле сайта, /avatar set — поставить её боту."""
+    if not _is_feolar(update):
+        await _deny(update)
+        return
+    import httpx
+    import avatar_builder
+    from telegram import InputProfilePhotoStatic
+    msg = await fmt.reply(update.message, line("card", "Собираю аватарку из значка клана…"))
+    try:
+        clan = await _coc_safe(coc_client.get_clan, CLAN_TAG)
+        url = clan.badge.large or clan.badge.url
+        async with httpx.AsyncClient(timeout=20) as client:
+            badge = (await client.get(url)).content
+        png = avatar_builder.build_avatar(badge).getvalue()
+        if _args(update).lower() in ("set", "поставить", "установить"):
+            await context.bot.set_my_profile_photo(photo=InputProfilePhotoStatic(photo=png))
+            await update.message.reply_photo(png, caption="Аватарка бота обновлена.")
+        else:
+            await update.message.reply_document(png, filename="warfil_avatar.png",
+                                                caption="Аватарка как на сайте. Поставить боту: /avatar set")
+        await msg.delete()
+    except Exception as exc:
+        logger.error(f"/avatar: {exc}", exc_info=True)
+        await fmt.edit(msg, fmt.err(f"Не получилось: {esc(exc)}"))
 
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -886,13 +942,14 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application):
     await coc_api.login()
 
-    if config.EMOJI_PACK and not game_emoji.mapped():
+    if config.EMOJI_PACK:
         try:
             pack = await application.bot.get_sticker_set(game_emoji.pack_name_from(config.EMOJI_PACK))
-            found = game_emoji.auto_map_stickers(pack.stickers)
+            game_emoji.remember_pack(pack.stickers)
+            found = game_emoji.auto_map_stickers(pack.stickers) if not game_emoji.mapped() else {}
             if found:
                 game_emoji.set_many(found)
-            logger.info(f"Эмодзи-пак {pack.name}: сопоставлено {len(found)}")
+            logger.info(f"Эмодзи-пак {pack.name}: {len(pack.stickers)} шт., сопоставлено {len(found)}")
         except Exception as exc:
             logger.warning(f"Эмодзи-пак {config.EMOJI_PACK}: {exc}")
 
@@ -976,6 +1033,7 @@ def main():
         ("listchats", listchats_command), ("status", status_command), ("check", check_command),
         ("emoji", emoji_command), ("emojipack", emojipack_command),
         ("setemoji", setemoji_command), ("emojireset", emojireset_command),
+        ("emojilist", emojilist_command), ("avatar", avatar_command),
         ("teststart", teststart_command), ("testend", testend_command),
         ("testremind", testremind_command),
         ("testcwlstart", testcwlstart_command), ("testcwlend", testcwlend_command),

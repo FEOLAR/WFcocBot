@@ -64,6 +64,7 @@ KEYS: dict[str, tuple[str, str]] = {
 }
 
 _map: dict[str, str] = {}      # ключ -> custom_emoji_id
+pack_ids: list[str] = []       # custom_emoji_id всех эмодзи пака по порядку
 custom_enabled = True          # выключается, если Telegram отказал
 
 
@@ -141,6 +142,17 @@ def auto_map_stickers(stickers, overwrite: bool = False) -> dict[str, str]:
                 used.add(cid)
                 break
     return found
+
+
+def remember_pack(stickers):
+    global pack_ids
+    pack_ids = [s.custom_emoji_id for s in stickers if getattr(s, "custom_emoji_id", None)]
+
+
+def pack_emoji(i: int, fallback: str = "⭐") -> str:
+    """Эмодзи пака по номеру (с 1) — для каталога /emojilist."""
+    cid = pack_ids[i - 1]
+    return f'<tg-emoji emoji-id="{html.escape(cid)}">{fallback}</tg-emoji>'
 
 
 def pack_name_from(arg: str) -> str:
