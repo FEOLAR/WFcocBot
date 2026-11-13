@@ -69,8 +69,8 @@ TZ_LABEL = _env("TZ_LABEL", "МСК")
 # Как часто (минуты) присылать сводку атак во время войны / раунда ЛВК / рейдов.
 # 0 — не присылать, останутся только старт, напоминания и итоги.
 WAR_DIGEST_MINUTES = _env_int("WAR_DIGEST_MINUTES", 120)
-CWL_DIGEST_MINUTES = _env_int("CWL_DIGEST_MINUTES", 0)
-RAID_DIGEST_MINUTES = _env_int("RAID_DIGEST_MINUTES", 0)
+CWL_DIGEST_MINUTES = _env_int("CWL_DIGEST_MINUTES", 120)
+RAID_DIGEST_MINUTES = _env_int("RAID_DIGEST_MINUTES", 240)
 
 # Папка с данными бота (привязки, чаты рассылки, состояние уведомлений).
 # Bothost сам задаёт DATA_DIR=/app/data — это постоянный диск.
