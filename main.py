@@ -868,6 +868,8 @@ async def emojireset_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     text = update.message.text
     if text == "📋 Список клана":
         await team_command(update, context)
@@ -980,7 +982,7 @@ def main():
         ("testraidstart", testraidstart_command), ("testraidend", testraidend_command),
     ]:
         app.add_handler(CommandHandler(name, fn))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND, echo))
     app.add_error_handler(error_handler)
 
     logger.info("Бот запущен...")

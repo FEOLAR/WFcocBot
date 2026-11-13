@@ -36,9 +36,14 @@ def line(key: str, text: str) -> str:
     return f"{e(key)} {text}"
 
 
+MAX_LIST = 40   # длинные списки режем, чтобы не упереться в лимит Telegram (4096)
+
+
 def quote(lines: list[str], fold_after: int = 8) -> str:
     if not lines:
         return ""
+    if len(lines) > MAX_LIST:
+        lines = lines[:MAX_LIST] + [f"…и ещё {len(lines) - MAX_LIST}"]
     body = "\n".join(lines)
     tag = "blockquote expandable" if len(lines) > fold_after else "blockquote"
     return f"<{tag}>{body}</{tag.split()[0]}>"
@@ -181,6 +186,14 @@ async def _with_fallback(call, text: str, kwargs: dict):
     try:
         return await call(text=text, **kwargs)
     except BadRequest as exc:
+        if "too long" in str(exc).lower():
+            plain = game_emoji.strip_custom(text)
+            cut = plain[:3900].rsplit("\n", 1)[0]
+            for tag, opener in (("code", "<code>"), ("i", "<i>"), ("b", "<b>"),
+                                ("blockquote", "<blockquote")):
+                if cut.count(opener) > cut.count(f"</{tag}>"):
+                    cut += f"</{tag}>"
+            return await call(text=cut + "\n…", **kwargs)
         has_custom = "<tg-emoji" in text or (
             isinstance(kwargs.get("reply_markup"), InlineKeyboardMarkup)
             and any(b.icon_custom_emoji_id for r in kwargs["reply_markup"].inline_keyboard for b in r))

@@ -29,7 +29,9 @@ def _env_int(name: str, default: int) -> int:
 
 
 # ── Секреты ───────────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = _env("TELEGRAM_BOT_TOKEN")
+# Bothost и другие хостинги называют переменную по-разному — берём любую
+TELEGRAM_BOT_TOKEN = (_env("TELEGRAM_BOT_TOKEN") or _env("BOT_TOKEN")
+                      or _env("TELEGRAM_TOKEN") or _env("TOKEN"))
 
 # Вариант 1: готовый API-ключ с developer.clashofclans.com (для статического IP)
 COC_API_KEY = _env("COC_API_KEY")
@@ -60,6 +62,7 @@ CWL_DIGEST_MINUTES = _env_int("CWL_DIGEST_MINUTES", 0)
 RAID_DIGEST_MINUTES = _env_int("RAID_DIGEST_MINUTES", 0)
 
 # Папка с данными бота (привязки, чаты рассылки, состояние уведомлений).
+# Bothost сам задаёт DATA_DIR=/app/data — это постоянный диск.
 # По умолчанию — data/ рядом с main.py.
 DATA_DIR = _env("DATA_DIR")
 
