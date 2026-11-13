@@ -79,4 +79,4 @@ DATA_DIR = _env("DATA_DIR")
 
 # Набор кастомных эмодзи (имя из ссылки t.me/addemoji/<имя>).
 # Подтягивается при старте. Работает, если у владельца бота есть Telegram Premium.
-EMOJI_PACK = _env("EMOJI_PACK")
+EMOJI_PACK = _env("EMOJI_PACK", "Clashpakking")   # t.me/addemoji/Clashpakking
