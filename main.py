@@ -6,7 +6,6 @@ Telegram-бот клана WarFil (Clash of Clans).
 import asyncio
 import logging
 import os
-import random
 import threading
 import unicodedata
 from collections import defaultdict
@@ -125,7 +124,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{e('capital')} /raid — рейды столицы",
         f"{e('team')} /team — состав клана",
         f"{e('stats')} /statistic — статистика в Excel",
-        f"{e('card')} /card — карточка клана",
+        f"{e('card')} /card — карточка клана, /card 1–6 — выбрать стиль",
         f"{e('link')} /register ник — привязать свой аккаунт",
         "",
         "<i>Пример: /register WarriorKing</i>",
@@ -673,7 +672,6 @@ async def statistic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка /statistic: {e}", exc_info=True)
         await fmt.edit(msg, fmt.err("Не получилось собрать файл: CoC API не ответил. Попробуй через пару минут."))
 
-CARD_BACKGROUNDS = ["card_background.png", "card_bg_2.png", "card_bg_3.png", "card_bg_4.png"]
 
 
 async def card_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -686,13 +684,12 @@ async def card_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raids.append(r)
         except Exception:
             pass
-        base = os.path.dirname(os.path.abspath(__file__))
-        available = [os.path.join(base, p) for p in CARD_BACKGROUNDS if os.path.exists(os.path.join(base, p))]
-        buf = await card_builder.build_card(clan, raids=raids,
-                                            background_path=random.choice(available) if available else None)
+        arg = _args(update)
+        style = int(arg) if arg.isdigit() else None
+        buf = await card_builder.build_card(clan, raids=raids, style=style)
         caption = "\n".join([
             f"{e('clan')} <b>{esc(clan.name)}</b>, уровень {clan.level}",
-            f"{e('site')} {config.CLAN_WEBSITE.replace('https://', '')}",
+            f"{e('card')} Стиль {esc(getattr(buf, 'style', ''))}. Выбрать другой: /card 1 … /card 6",
         ])
         try:
             await update.message.reply_photo(photo=buf, caption=caption, parse_mode="HTML",
@@ -986,7 +983,7 @@ async def post_init(application):
         BotCommand("raid",      "Рейды столицы"),
         BotCommand("team",      "Состав клана"),
         BotCommand("statistic", "Статистика в Excel"),
-        BotCommand("card",      "Карточка клана"),
+        BotCommand("card",      "Карточка клана (/card 1–6 — стиль)"),
         BotCommand("register",  "Привязать свой аккаунт"),
         BotCommand("help",      "Все команды"),
         BotCommand("start",     "О клане"),
