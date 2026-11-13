@@ -192,11 +192,9 @@ async def team_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             members = groups.get(role)
             if not members:
                 continue
-            key, label = role_titles[role]
-            count = f" {len(members)}" if role != "leader" else ""
-            # у пака есть значки-плашки «Глава», «Соруки», «Старик» — тогда текст не дублируем
-            head = (f"{e(key)}<b>{count}</b>" if game_emoji.icon_id(key)
-                    else f"{e(key)} <b>{label}{':' + count if count else ''}</b>")
+            _, label = role_titles[role]
+            count = f": {len(members)}" if role != "leader" else ""
+            head = f"<b>{label}{count}</b>"
             rows = [fmt.player(m.name, m.town_hall, tg_map.get(_norm_name(m.name))) for m in members]
             lines.append(f"\n{head}\n{quote(rows, fold_after=15)}")
         await fmt.edit(msg, "\n".join(lines), reply_markup=fmt.clan_buttons())
