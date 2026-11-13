@@ -7,7 +7,7 @@ import re as _re
 import asyncio
 import logging
 
-import config
+import settings as config
 
 logger = logging.getLogger(__name__)
 

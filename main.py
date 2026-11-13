@@ -12,7 +12,7 @@ import unicodedata
 from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-import config  # загружает .env
+import settings as config
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",

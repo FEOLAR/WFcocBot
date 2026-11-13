@@ -26,7 +26,7 @@ from datetime import timedelta
 import coc
 from telegram.error import ChatMigrated, Forbidden
 
-import config
+import settings as config
 import fmt
 import storage
 import stats_storage

@@ -60,7 +60,7 @@ def _data_dir() -> pathlib.Path:
     """
     import shutil
     try:
-        import config as _cfg
+        import settings as _cfg
         custom = getattr(_cfg, "DATA_DIR", "")
     except ImportError:
         custom = os.environ.get("DATA_DIR", "")

@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 
-import config
+import settings as config
 import game_emoji
 from game_emoji import e
 

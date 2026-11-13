@@ -1,71 +1,17 @@
-"""
-Настройки бота WarFil.
+TELEGRAM_BOT_TOKEN = "8690157836:AAFXrVdynsp_fueHyln2-29T2qtoNNaw1Xw"
 
-Секреты (токен бота, пароль CoC) больше НЕ хранятся в репозитории.
-Положи их в файл .env рядом с main.py (пример — .env.example)
-или в переменные окружения сервера / PM2.
-"""
-import os
-import pathlib
+# ── Вариант 1 (рекомендуемый): прямой API ключ ────────────────────────────────
+# Зарегистрируй ключ на https://developer.clashofclans.com
+# для IP адреса: 34.26.196.168
+# Вставь полученный ключ сюда:
+COC_API_KEY = ""
 
-BASE_DIR = pathlib.Path(__file__).resolve().parent
+# ── Вариант 2 (резервный): вход через email/пароль ────────────────────────────
+# Используется только если COC_API_KEY пустой
+COC_EMAIL    = "shartol3002@gmail.com"
+COC_PASSWORD = "NJKZtujh3002"
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(BASE_DIR / ".env")
-except ImportError:
-    pass
-
-
-def _env(name: str, default: str = "") -> str:
-    return os.environ.get(name, default).strip()
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(_env(name, str(default)))
-    except ValueError:
-        return default
-
-
-# ── Секреты ───────────────────────────────────────────────────────────────────
-# Bothost и другие хостинги называют переменную по-разному — берём любую
-TELEGRAM_BOT_TOKEN = (_env("TELEGRAM_BOT_TOKEN") or _env("BOT_TOKEN")
-                      or _env("TELEGRAM_TOKEN") or _env("TOKEN"))
-
-# Вариант 1: готовый API-ключ с developer.clashofclans.com (для статического IP)
-COC_API_KEY = _env("COC_API_KEY")
-# Вариант 2: вход через аккаунт разработчика — бот сам пересоздаёт ключ под IP
-COC_EMAIL = _env("COC_EMAIL")
-COC_PASSWORD = _env("COC_PASSWORD")
-# Необязательно: http://логин:пароль@адрес:порт
-COC_PROXY = _env("COC_PROXY")
-
-# ── Клан ──────────────────────────────────────────────────────────────────────
-CLAN_TAG = _env("CLAN_TAG", "#2R02GGRUJ")
-CLAN_BRAND = _env("CLAN_BRAND", "WarFil")
-CLAN_WEBSITE = _env("CLAN_WEBSITE", "https://www.warfilcoc.ru")
-TG_GROUP_LINK = _env("TG_GROUP_LINK", "https://t.me/warfil_clan")
-ADMIN_USERNAME = _env("ADMIN_USERNAME", "feolar")
-CLAN_GROUP_CHAT_ID = _env_int("CLAN_GROUP_CHAT_ID", 0)
-
-# ── Время ─────────────────────────────────────────────────────────────────────
-# Смещение от UTC для отображения времени в сообщениях (Москва = 3)
-TZ_OFFSET_HOURS = _env_int("TZ_OFFSET_HOURS", 3)
-TZ_LABEL = _env("TZ_LABEL", "МСК")
-
-# ── Уведомления ───────────────────────────────────────────────────────────────
-# Как часто (минуты) присылать сводку атак во время войны / раунда ЛВК / рейдов.
-# 0 — не присылать, останутся только старт, напоминания и итоги.
-WAR_DIGEST_MINUTES = _env_int("WAR_DIGEST_MINUTES", 120)
-CWL_DIGEST_MINUTES = _env_int("CWL_DIGEST_MINUTES", 0)
-RAID_DIGEST_MINUTES = _env_int("RAID_DIGEST_MINUTES", 0)
-
-# Папка с данными бота (привязки, чаты рассылки, состояние уведомлений).
-# Bothost сам задаёт DATA_DIR=/app/data — это постоянный диск.
-# По умолчанию — data/ рядом с main.py.
-DATA_DIR = _env("DATA_DIR")
-
-# Набор кастомных эмодзи (имя из ссылки t.me/addemoji/<имя>).
-# Подтягивается при старте. Работает, если у владельца бота есть Telegram Premium.
-EMOJI_PACK = _env("EMOJI_PACK")
+# ── Прокси (необязательно) ────────────────────────────────────────────────────
+# Если запускаешь бота не на Replit и нет статического IP:
+# COC_PROXY = "http://логин:пароль@адрес:порт"
+COC_PROXY = ""
