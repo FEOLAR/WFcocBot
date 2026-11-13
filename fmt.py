@@ -50,7 +50,7 @@ def quote(lines: list[str], fold_after: int = 8) -> str:
 
 
 def player(name: str, th: int | None = None, tg: str | None = None, extra: str = "") -> str:
-    th_part = f"ТХ{th} " if th else ""
+    th_part = f"{game_emoji.th(th)} " if th else ""
     tg_part = f" @{esc(tg)}" if tg else ""
     extra_part = f" {extra}" if extra else ""
     return f"{th_part}<b>{esc(name)}</b>{extra_part}{tg_part}"

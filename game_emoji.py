@@ -62,6 +62,9 @@ KEYS: dict[str, tuple[str, str]] = {
     "chat":      ("💬", "беседа"),
     "hello":     ("👋", "приветствие"),
 }
+# Ратуши: th1 … th18 — показываются вместо текста «ТХ16» в списках игроков
+for _n in range(18, 0, -1):
+    KEYS[f"th{_n}"] = ("🏠", f"ратуша {_n}")
 
 # Раскладка для пака t.me/addemoji/Clashpakking: ключ -> номер эмодзи в паке (с 1).
 # Номера сверены по порядку в паке (170 шт.). Если автор пака поменяет
@@ -76,6 +79,8 @@ PACK_DEFAULTS = {
         "time": 141, "link": 145, "stats": 148, "team": 149, "trophy": 153,
         "chat": 155, "done": 157, "miss": 158, "level": 159, "warn": 160,
         "leader": 164, "coleader": 165, "elder": 166, "member": 167, "lose": 170,
+        # ратуши: в паке идут от ТХ18 (№7) до ТХ1 (№24)
+        **{f"th{n}": 25 - n for n in range(1, 19)},
     }),
 }
 
@@ -100,6 +105,14 @@ def e(key: str) -> str:
     if cid and custom_enabled:
         return f'<tg-emoji emoji-id="{html.escape(cid)}">{fb}</tg-emoji>'
     return fb
+
+
+def th(level) -> str:
+    """Значок ратуши из пака или текст «ТХ16», если кастомных эмодзи нет."""
+    if not level:
+        return ""
+    key = f"th{int(level)}"
+    return e(key) if (custom_enabled and key in _map) else f"ТХ{level}"
 
 
 def icon_id(key: str) -> str | None:

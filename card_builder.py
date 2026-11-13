@@ -149,7 +149,7 @@ def _stat(d, x, y, label, value, value_color=CREAM, size=34, max_w=200):
     d.text((x, y + 24), value, font=_fit(d, value, _display, size, max_w, 16), fill=value_color)
 
 
-def render_card(clan, raids=None, badge: Image.Image | None = None) -> Image.Image:
+def render_site(clan, raids=None, badge: Image.Image | None = None) -> Image.Image:
     img = _background()
     d = ImageDraw.Draw(img)
     members = list(clan.members or [])
@@ -286,13 +286,25 @@ def render_card(clan, raids=None, badge: Image.Image | None = None) -> Image.Ima
     return img
 
 
-async def build_card(clan, raids=None, background_path: str | None = None) -> io.BytesIO:
+def render_card(clan, raids=None, badge: Image.Image | None = None, style: int | None = None) -> Image.Image:
+    import random
+    import card_styles
+    styles = [(render_site, "Сайт")] + card_styles.STYLES
+    idx = (style - 1) if style and 1 <= style <= len(styles) else random.randrange(len(styles))
+    img = styles[idx][0](clan, raids, badge)
+    img.info["style"] = f"{idx + 1}. {styles[idx][1]}"
+    return img
+
+
+async def build_card(clan, raids=None, background_path: str | None = None,
+                     style: int | None = None) -> io.BytesIO:
     badge = None
     if getattr(clan, "badge", None) is not None:
         badge = await _dl_image(clan.badge.large or clan.badge.url)
-    img = render_card(clan, raids=raids, badge=badge)
+    img = render_card(clan, raids=raids, badge=badge, style=style)
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG", optimize=True)
     buf.seek(0)
     buf.name = "warfil_card.png"
+    buf.style = img.info.get("style", "")
     return buf
