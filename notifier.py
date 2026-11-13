@@ -145,7 +145,9 @@ async def _maybe_digest(bot, sec: dict, minutes: int, started_at, text: str, mar
     if last == 0:
         sec["last_digest"] = now   # первый цикл после старта бота: отсчёт с нуля
         return
-    if await broadcast(bot, text, markup):
+    if callable(text):
+        text = await text()
+    if text and await broadcast(bot, text, markup):
         sec["last_digest"] = now
 
 
@@ -347,8 +349,10 @@ async def raid_tick(bot):
             text = views.raid_reminder(raid, await clan_members())
             if await notify_once(bot, sec, due[-1], text):
                 _mark(sec, *due)
-        status, _ = views.raid_status(raid)
-        await _maybe_digest(bot, sec, config.RAID_DIGEST_MINUTES, start, status)
+        async def raid_digest():
+            status, _ = views.raid_status(raid)
+            return status + "\n" + "\n".join(views.raid_left_blocks(raid, await clan_members()))
+        await _maybe_digest(bot, sec, config.RAID_DIGEST_MINUTES, start, raid_digest)
     else:
         _mark(sec, "start", *[k for _, k in RAID_REMINDERS])
         if end and now - end > END_GRACE * 2:
