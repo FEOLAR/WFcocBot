@@ -163,7 +163,7 @@ def raid_json(state, start, end, members):
 
 
 async def run():
-    storage.add_notify_chat(-100123)
+    storage._save_notify_chats([-100123])  # без чатов из репозитория
     bot = FakeBot()
 
     # ── Война: подготовка → бой → напоминания → итоги ───────────────────────

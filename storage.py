@@ -33,13 +33,30 @@ def _norm(name: str) -> str:
     normalized = unicodedata.normalize("NFC", name)
     return "".join(ch for ch in normalized if not _is_invis(ch)).lower()
 
-def _data_dir() -> pathlib.Path:
-    """Папка данных: DATA_DIR из .env, иначе data/ рядом с ботом.
+def _merge_chat_files(paths) -> list:
+    merged = []
+    for p in paths:
+        try:
+            d = json.loads(pathlib.Path(p).read_text(encoding="utf-8") or "{}")
+            merged += d.get("chat_ids", []) or ([d["chat_id"]] if d.get("chat_id") else [])
+        except Exception:
+            pass
+    return list(dict.fromkeys(merged))
 
-    Раньше бот сначала пробовал /data. На VPS под root эта папка создаётся
-    пустой — бот «терял» список чатов рассылки и молча переставал присылать
-    уведомления. Теперь всё лежит рядом с ботом, а старые файлы из /data
-    переносятся автоматически.
+
+def _data_dir() -> pathlib.Path:
+    """Где бот хранит данные.
+
+    1. DATA_DIR из настроек, если задан.
+    2. /data, если это подключённый постоянный диск (volume) — на хостинге
+       он переживает пересборку контейнера.
+    3. Иначе data/ рядом с ботом.
+
+    Раньше бот брал /data всегда, когда туда можно писать. В Docker-контейнере
+    под root это обычная пустая папка, которая обнуляется при каждой
+    пересборке: список чатов рассылки пропадал, и уведомления молча
+    переставали уходить. Теперь в выбранную папку при старте докладываются
+    файлы из data/ репозитория, которых там нет, а чаты рассылки объединяются.
     """
     import shutil
     try:
@@ -47,25 +64,26 @@ def _data_dir() -> pathlib.Path:
         custom = getattr(_cfg, "DATA_DIR", "")
     except ImportError:
         custom = os.environ.get("DATA_DIR", "")
-    base = pathlib.Path(__file__).resolve().parent
-    target = pathlib.Path(custom) if custom else base / "data"
+    repo = pathlib.Path(__file__).resolve().parent / "data"
+    legacy = pathlib.Path("/data")
+
+    if custom:
+        target = pathlib.Path(custom)
+    elif legacy.is_dir() and os.path.ismount(legacy) and os.access(legacy, os.W_OK):
+        target = legacy
+    else:
+        target = repo
     target.mkdir(parents=True, exist_ok=True)
 
-    legacy = pathlib.Path("/data")
-    if legacy.resolve() != target.resolve() and legacy.is_dir():
-        for src in legacy.glob("*.json"):
+    sources = [p for p in (repo, legacy) if p.is_dir() and p.resolve() != target.resolve()]
+    for src_dir in sources:
+        for src in src_dir.glob("*.json"):
             dst = target / src.name
             try:
-                if src.name == "notify_chat.json" and dst.exists():
-                    merged = []
-                    for p in (dst, src):
-                        try:
-                            d = json.loads(p.read_text(encoding="utf-8") or "{}")
-                            merged += d.get("chat_ids", []) or ([d["chat_id"]] if d.get("chat_id") else [])
-                        except Exception:
-                            pass
-                    dst.write_text(json.dumps({"chat_ids": list(dict.fromkeys(merged))}), encoding="utf-8")
-                elif not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime:
+                if src.name == "notify_chat.json":
+                    chats = _merge_chat_files([dst, src])
+                    dst.write_text(json.dumps({"chat_ids": chats}), encoding="utf-8")
+                elif not dst.exists() or dst.stat().st_size == 0:
                     shutil.copy2(src, dst)
             except OSError:
                 pass
