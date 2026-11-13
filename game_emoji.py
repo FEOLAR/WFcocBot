@@ -63,6 +63,22 @@ KEYS: dict[str, tuple[str, str]] = {
     "hello":     ("👋", "приветствие"),
 }
 
+# Раскладка для пака t.me/addemoji/Clashpakking: ключ -> номер эмодзи в паке (с 1).
+# Номера сверены по порядку в паке (170 шт.). Если автор пака поменяет
+# состав, бот это заметит по количеству и откатится на автоподбор.
+PACK_DEFAULTS = {
+    "clashpakking": (170, {
+        "clan": 2, "site": 1, "hello": 4, "fire": 43,
+        "star": 6, "half": 5, "th": 9, "district": 20, "prep": 37,
+        "war": 87, "attack": 88, "tie": 89, "win": 93, "cwl": 105,
+        "gold": 122, "capital": 125, "boom": 126, "medal": 130,
+        "card": 133, "alarm": 134, "date": 138, "help": 139, "admin": 140,
+        "time": 141, "link": 145, "stats": 148, "team": 149, "trophy": 153,
+        "chat": 155, "done": 157, "miss": 158, "level": 159, "warn": 160,
+        "leader": 164, "coleader": 165, "elder": 166, "member": 167, "lose": 170,
+    }),
+}
+
 _map: dict[str, str] = {}      # ключ -> custom_emoji_id
 pack_ids: list[str] = []       # custom_emoji_id всех эмодзи пака по порядку
 custom_enabled = True          # выключается, если Telegram отказал
@@ -102,11 +118,26 @@ def _bare(s: str) -> str:
     return (s or "").replace("️", "").replace("‍", "").strip()
 
 
-def set_many(pairs: dict[str, str]):
+def set_many(pairs: dict[str, str], manual: bool = False):
     data = storage.load_emoji_map()
     data.update(pairs)
+    if manual:
+        data["_manual"] = sorted(set(data.get("_manual", [])) | set(pairs))
     storage.save_emoji_map(data)
     reload()
+
+
+def apply_pack_defaults(pack_name: str, stickers) -> int:
+    """Раскладывает пак по смыслу (если для него есть готовая раскладка).
+    Ручные привязки (/setemoji) не трогает. Возвращает число привязанных ключей."""
+    preset = PACK_DEFAULTS.get((pack_name or "").lower())
+    ids = [s.custom_emoji_id for s in stickers if getattr(s, "custom_emoji_id", None)]
+    if not preset or len(ids) != preset[0]:
+        return 0
+    manual = set(storage.load_emoji_map().get("_manual", []))
+    pairs = {k: ids[i - 1] for k, i in preset[1].items() if k not in manual and 1 <= i <= len(ids)}
+    set_many(pairs)
+    return len(pairs)
 
 
 def reset():
