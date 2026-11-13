@@ -34,16 +34,43 @@ def _norm(name: str) -> str:
     return "".join(ch for ch in normalized if not _is_invis(ch)).lower()
 
 def _data_dir() -> pathlib.Path:
-    p = pathlib.Path("/data")
+    """Папка данных: DATA_DIR из .env, иначе data/ рядом с ботом.
+
+    Раньше бот сначала пробовал /data. На VPS под root эта папка создаётся
+    пустой — бот «терял» список чатов рассылки и молча переставал присылать
+    уведомления. Теперь всё лежит рядом с ботом, а старые файлы из /data
+    переносятся автоматически.
+    """
+    import shutil
     try:
-        p.mkdir(exist_ok=True)
-        (p / ".writable_check").touch()
-        (p / ".writable_check").unlink()
-        return p
-    except OSError:
-        local = pathlib.Path("data")
-        local.mkdir(exist_ok=True)
-        return local
+        import config as _cfg
+        custom = getattr(_cfg, "DATA_DIR", "")
+    except ImportError:
+        custom = os.environ.get("DATA_DIR", "")
+    base = pathlib.Path(__file__).resolve().parent
+    target = pathlib.Path(custom) if custom else base / "data"
+    target.mkdir(parents=True, exist_ok=True)
+
+    legacy = pathlib.Path("/data")
+    if legacy.resolve() != target.resolve() and legacy.is_dir():
+        for src in legacy.glob("*.json"):
+            dst = target / src.name
+            try:
+                if src.name == "notify_chat.json" and dst.exists():
+                    merged = []
+                    for p in (dst, src):
+                        try:
+                            d = json.loads(p.read_text(encoding="utf-8") or "{}")
+                            merged += d.get("chat_ids", []) or ([d["chat_id"]] if d.get("chat_id") else [])
+                        except Exception:
+                            pass
+                    dst.write_text(json.dumps({"chat_ids": list(dict.fromkeys(merged))}), encoding="utf-8")
+                elif not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime:
+                    shutil.copy2(src, dst)
+            except OSError:
+                pass
+    return target
+
 
 _DIR = _data_dir()
 
@@ -169,8 +196,11 @@ def get_tg_username_map() -> dict[str, str]:
 def _load_notify_chats() -> list[int]:
     if not os.path.exists(NOTIFY_CHAT_FILE):
         return []
-    with open(NOTIFY_CHAT_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(NOTIFY_CHAT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
     # Backward compat: old format was {"chat_id": 123}
     if "chat_ids" in data:
         return data["chat_ids"]
@@ -277,3 +307,51 @@ def get_raid_state() -> dict:
             return json.load(f)
     except (json.JSONDecodeError, KeyError):
         return {}
+
+
+def replace_notify_chat(old_id: int, new_id: int):
+    """Группа стала супергруппой — у неё новый ID. Подменяем в списке."""
+    chats = _load_notify_chats()
+    chats = [new_id if c == old_id else c for c in chats]
+    _save_notify_chats(list(dict.fromkeys(chats)))
+
+
+DATA_DIR = str(_DIR)
+
+
+# ── Состояние уведомлений (что уже отправлено) ───────────────────────────────
+NOTIFY_STATE_FILE = str(_DIR / "notify_state.json")
+
+
+def load_notify_state() -> dict:
+    try:
+        with open(NOTIFY_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_notify_state(state: dict):
+    tmp = NOTIFY_STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, NOTIFY_STATE_FILE)
+
+
+# ── Кастомные эмодзи ─────────────────────────────────────────────────────────
+EMOJI_FILE = str(_DIR / "emoji.json")
+
+
+def load_emoji_map() -> dict:
+    try:
+        with open(EMOJI_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_emoji_map(data: dict):
+    with open(EMOJI_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)

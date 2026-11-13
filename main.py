@@ -1,1321 +1,484 @@
-try:
-    from dotenv import load_dotenv; load_dotenv()
-except ImportError:
-    pass
+"""
+Telegram-бот клана WarFil (Clash of Clans).
 
-import os
-import re as _re
-
-# Fallback: load tokens from config.py if env vars not set
-try:
-    import config as _cfg
-    for _k in ("TELEGRAM_BOT_TOKEN", "COC_EMAIL", "COC_PASSWORD", "COC_API_KEY", "COC_PROXY"):
-        if not os.environ.get(_k):
-            val = getattr(_cfg, _k, "")
-            if val:
-                os.environ[_k] = val
-except ImportError:
-    pass
-
-# ── Proxy setup for Clash of Clans API (static IP) ──────────────────────────
-# Set COC_PROXY in config.py or env to a static HTTP/SOCKS proxy URL.
-# Example: http://user:pass@proxy.example.com:8080
-# This keeps the same IP across restarts so the API key never changes.
-_COC_PROXY = os.environ.get("COC_PROXY") or os.environ.get("QUOTAGUARD_URL")
-if _COC_PROXY:
-    os.environ.setdefault("HTTP_PROXY",  _COC_PROXY)
-    os.environ.setdefault("HTTPS_PROXY", _COC_PROXY)
-    os.environ.setdefault("http_proxy",  _COC_PROXY)
-    os.environ.setdefault("https_proxy", _COC_PROXY)
-    # Patch aiohttp (used by coc.py) to honour env-based proxy
-    try:
-        import aiohttp as _aiohttp
-        _orig_session = _aiohttp.ClientSession.__init__
-        def _proxy_session(self, *a, **kw):
-            kw.setdefault("trust_env", True)
-            _orig_session(self, *a, **kw)
-        _aiohttp.ClientSession.__init__ = _proxy_session
-    except Exception:
-        pass
-
+Запуск:  python main.py   (секреты — в .env, см. .env.example)
+"""
 import asyncio
 import logging
+import os
+import random
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime
+import unicodedata
 from collections import defaultdict
-import coc
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton, BotCommand, MenuButtonCommands
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+import config  # загружает .env
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+if not config.TELEGRAM_BOT_TOKEN:
+    raise SystemExit(
+        "Не задан TELEGRAM_BOT_TOKEN. Создай файл .env рядом с main.py "
+        "(образец — .env.example) и перезапусти бота."
+    )
+
+import coc
+from telegram import Update, BotCommand, MenuButtonCommands, MessageEntity
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     filters, ContextTypes, TypeHandler, ApplicationHandlerStop,
 )
+
 import storage
 import stats_storage
 import excel_builder
 import card_builder
 import fmt
+import game_emoji
+import views
+import notifier
+import coc_api
+from coc_api import coc_client, _coc_safe, _norm_name, CLAN_TAG
+from fmt import e, esc, title, line, quote
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+TOKEN = config.TELEGRAM_BOT_TOKEN
+ADMIN = config.ADMIN_USERNAME.lower()
 
-IS_PRODUCTION = os.environ.get("REPLIT_DEPLOYMENT") == "1"
+ROLE_ORDER = {"leader": 0, "coLeader": 1, "admin": 2, "member": 3}
 
-TOKEN        = os.environ["TELEGRAM_BOT_TOKEN"]
-COC_EMAIL    = os.environ.get("COC_EMAIL", "")
-COC_PASSWORD = os.environ.get("COC_PASSWORD", "")
-COC_API_KEY  = os.environ.get("COC_API_KEY", "")
-CLAN_TAG       = "#2R02GGRUJ"
-CLAN_WEBSITE   = "https://www.warfilcoc.ru"
-TG_GROUP_LINK  = "https://t.me/warfil_clan"   # ← замени на реальную ссылку беседы
-WAR_NOTIFY_USERNAME = "feolar"                 # username получателя авто-рассылки войны
-
-# ── Защита доступа: ID беседы клана ──────────────────────────────────────────
-# Заполни после первого /addchat — возьми ID из /listchats.
-# Если 0 — бот автоматически возьмёт первый зарегистрированный чат из /addchat.
-CLAN_GROUP_CHAT_ID: int = 0
-
-ROLE_ORDER = {
-    "leader": 0,
-    "coLeader": 1,
-    "admin": 2,
-    "member": 3,
-}
-
-
-def _norm_name(name: str) -> str:
-    """NFC + lowercase + удаляем невидимые/форматирующие Unicode символы.
-
-    CoC и Telegram могут по-разному хранить невидимые символы в никах:
-    монгольские вариационные селекторы (U+180B-U+180F), variation selectors
-    (U+FE00-U+FE0F), нулевые пробелы (U+200B-U+200F), BOM и т.п.
-    Фильтруем точечно, чтобы не затронуть реальные диакритики (ā, ŕ, ķ...).
-    """
-    import unicodedata as _ud
-    # Диапазоны полностью невидимых символов
-    _INVIS = [
-        (0x180B, 0x180F),   # Mongolian Free Variation Selectors
-        (0xFE00, 0xFE0F),   # Variation Selectors VS1-VS16
-        (0xE0100, 0xE01EF), # Variation Selectors Supplement
-        (0x200B, 0x200F),   # Zero-width space, ZWNJ, ZWJ, LRM, RLM
-        (0x2060, 0x2064),   # Word joiner and invisible operators
-        (0xFEFF, 0xFEFF),   # BOM / ZWNBSP
-        (0x00AD, 0x00AD),   # Soft hyphen
-    ]
-    def _is_invis(ch: str) -> bool:
-        cat = _ud.category(ch)
-        if cat in ("Cf", "Cc"):
-            return True
-        cp = ord(ch)
-        return any(s <= cp <= e for s, e in _INVIS)
-
-    normalized = _ud.normalize("NFC", name)
-    return "".join(ch for ch in normalized if not _is_invis(ch)).lower()
-
-coc_client = coc.Client()
-
-
-def _extract_ip_from_error(err_str: str) -> str | None:
-    """Извлекаем реальный исходящий IP из текста ошибки CoC."""
-    m = _re.search(r'from IP (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', err_str)
-    return m.group(1) if m else None
-
-
-# IP → unix-timestamp последнего появления (сохраняется между перезапусками)
-_known_server_ips: dict[str, float] = {}
-
-_COC_DEV_URL = "https://developer.clashofclans.com/api"
-_KEY_NAME     = "warfil_bot"
-_KNOWN_IPS_FILE = os.path.join("data", "known_ips.json")
-
-
-def _load_known_ips() -> dict[str, float]:
-    """Загружаем сохранённые IP; поддерживаем старый формат (list) → конвертируем."""
-    try:
-        os.makedirs("data", exist_ok=True)
-        if os.path.exists(_KNOWN_IPS_FILE):
-            import json as _json
-            with open(_KNOWN_IPS_FILE, "r") as f:
-                raw = _json.load(f)
-            if isinstance(raw, list):          # старый формат — просто список IP
-                return {ip: 0.0 for ip in raw}
-            if isinstance(raw, dict):
-                return {k: float(v) for k, v in raw.items()}
-    except Exception:
-        pass
-    return {}
-
-
-def _save_known_ips():
-    """Сохраняем IP с временными метками."""
-    try:
-        import json as _json
-        os.makedirs("data", exist_ok=True)
-        with open(_KNOWN_IPS_FILE, "w") as f:
-            _json.dump(_known_server_ips, f)
-    except Exception as e:
-        logger.warning(f"Не удалось сохранить known_ips: {e}")
-
-
-def _register_ip(ip: str):
-    """Регистрируем IP с текущим временем → для выбора 10 самых свежих."""
-    import time as _time
-    _known_server_ips[ip] = _time.time()
-    _save_known_ips()
-
-
-def _get_key_ips() -> list[str]:
-    """Возвращает до 10 самых СВЕЖИХ индивидуальных IP для API-ключа.
-
-    CoC API проверяет точное совпадение IP, CIDR нотация не поддерживается.
-    Сортировка по timestamp последнего появления — самые свежие в начале.
-    """
-    by_recency = sorted(_known_server_ips, key=lambda ip: _known_server_ips[ip], reverse=True)
-    return by_recency[:10]
-
-
-# Загружаем сразу при старте модуля
-_known_server_ips = _load_known_ips()
-
-
-async def _rekey_coc(new_ip: str | None = None) -> bool:
-    """Пересоздаём CoC API ключ, включая ВСЕ известные IP сервера.
-
-    Работает напрямую через developer.clashofclans.com — не зависит от того,
-    какой IP coc.py «видит» через JWT.
-    Возвращает True при успехе, False при ошибке.
-    """
-    import aiohttp as _aio
-    if not (COC_EMAIL and COC_PASSWORD):
-        return False
-
-    if new_ip:
-        _register_ip(new_ip)  # сохраняем с timestamp сразу в файл
-
-    # 10 самых свежих IP (по timestamp, а не по алфавиту)
-    cidr_ranges: list[str] = _get_key_ips()
-    if not cidr_ranges:
-        cidr_ranges = ["127.0.0.1"]   # заглушка, не должна сработать
-
-    logger.info(f"Пересоздаю CoC ключ с cidrRanges={cidr_ranges}")
-
-    try:
-        async with _aio.ClientSession() as s:
-            # 1. Логин на developer site
-            r = await s.post(f"{_COC_DEV_URL}/login",
-                             json={"email": COC_EMAIL, "password": COC_PASSWORD})
-            if r.status != 200:
-                logger.error(f"Логин на developer site не удался: {r.status}")
-                return False
-
-            # 2. Получаем список ключей
-            r = await s.post(f"{_COC_DEV_URL}/apikey/list")
-            keys = (await r.json()).get("keys", [])
-
-            # 3. Удаляем ВСЕ наши старые ключи (и от coc.py, и наш warfil_bot)
-            OUR_NAMES = {_KEY_NAME, "Created with coc.py Client"}
-            for key in keys:
-                if key.get("name") in OUR_NAMES:
-                    await s.post(f"{_COC_DEV_URL}/apikey/revoke",
-                                 json={"id": key["id"]})
-                    logger.info(f"Удалён ключ '{key['name']}' id={key['id']} cidr={key.get('cidrRanges')}")
-
-            # 4. Создаём один новый ключ со всеми нужными CIDR
-            payload = {
-                "name"       : _KEY_NAME,
-                "description": f"Warfil bot — updated {__import__('datetime').datetime.now():%Y-%m-%d %H:%M}",
-                "cidrRanges" : cidr_ranges,
-                "scopes"     : ["clash"],
-            }
-            r = await s.post(f"{_COC_DEV_URL}/apikey/create", json=payload)
-            if r.status != 200:
-                body = await r.text()
-                logger.error(f"Создание ключа не удалось: {r.status} — {body}")
-                return False
-
-            key_data = await r.json()
-            new_token = key_data["key"]["key"]
-            logger.info(f"Новый ключ создан ✓ cidr={cidr_ranges}")
-
-            # 5. Активируем новый токен через login_with_tokens —
-            #    НЕ вызываем login(email,pass) чтобы coc.py не удалил наш CIDR ключ!
-            await coc_client.login_with_tokens(new_token)
-            logger.info("coc_client инициализирован через новый токен")
-            return True
-    except Exception as exc:
-        logger.error(f"_rekey_coc error: {exc}", exc_info=True)
-        return False
-
-
-def _is_ip_error(e: Exception) -> bool:
-    """True если ошибка — это IP-блокировка CoC API, а не реальный PrivateWarLog."""
-    return "invalidIp" in str(e) or "accessDenied.invalidIp" in str(e)
-
-
-# Замок чтобы только одна корутина пересоздавала ключ в один момент времени
-_rekey_lock: asyncio.Lock | None = None
-
-
-def _get_rekey_lock() -> asyncio.Lock:
-    global _rekey_lock
-    if _rekey_lock is None:
-        _rekey_lock = asyncio.Lock()
-    return _rekey_lock
-
-
-async def _coc_safe(fn, *args, **kwargs):
-    """Call a coc API function; on IP-Forbidden retry indefinitely until success.
-
-    Каждый провал регистрирует новый IP, пересоздаёт ключ (используя /24 CIDR —
-    одна запись покрывает всю подсеть Yandex Cloud), и повторяет запрос.
-    Глобальный замок гарантирует что несколько параллельных команд не перетирают
-    ключ одновременно — все ждут пока один пересоздаст.
-    Также перехватывает coc.PrivateWarLog когда coc.py неверно оборачивает
-    403/invalidIp (это происходит для get_league_group).
-    """
-    attempt = 0
-    last_exc: Exception | None = None
-
-    while True:
-        try:
-            return await fn(*args, **kwargs)
-        except (coc.errors.Forbidden, coc.errors.HTTPException, coc.errors.PrivateWarLog) as e:
-            if not (_is_ip_error(e) and COC_EMAIL and COC_PASSWORD):
-                raise  # не IP-ошибка → пробрасываем как есть
-
-            bad_ip = _extract_ip_from_error(str(e))
-            attempt += 1
-            last_exc = e
-
-            logger.warning(f"CoC IP ошибка попытка {attempt} (IP={bad_ip}) — обновляю ключ...")
-
-            # Только одна корутина пересоздаёт ключ, остальные ждут
-            async with _get_rekey_lock():
-                # Пока ждали замок — возможно другая корутина уже пересоздала ключ.
-                # Сначала регистрируем IP, потом пробуем пересоздать.
-                if bad_ip:
-                    _register_ip(bad_ip)
-
-                rekey_ok = False
-                for rekey_attempt in range(3):  # до 3 попыток пересоздания (portal может временно глючить)
-                    try:
-                        rekey_ok = await _rekey_coc()
-                        if rekey_ok:
-                            break
-                        logger.warning(f"Пересоздание ключа не удалось (попытка {rekey_attempt+1}/3), жду 3с...")
-                        await asyncio.sleep(3)
-                    except Exception as rekey_err:
-                        logger.error(f"_rekey_coc ошибка: {rekey_err}", exc_info=True)
-                        await asyncio.sleep(3)
-
-                if not rekey_ok:
-                    logger.error("Все попытки пересоздать ключ провалились — жду 10с перед следующим запросом")
-                    await asyncio.sleep(10)
-                    continue
-
-            # Небольшая пауза чтобы новый токен "осел" в CoC
-            await asyncio.sleep(1)
-
-
-# Active auto-update tasks: chat_id -> asyncio.Task
 _kv_tasks: dict[int, asyncio.Task] = {}
 
-CLAN_TAG_ENCODED = CLAN_TAG.replace("#", "%23")
-KV_BUTTONS = InlineKeyboardMarkup([
-    [
-        InlineKeyboardButton("🌐 Сайт клана", url=CLAN_WEBSITE),
-        InlineKeyboardButton("⚔️ Открыть игру", url=f"https://link.clashofclans.com/en?action=OpenClanProfile&tag={CLAN_TAG_ENCODED}"),
-    ]
-])
 
-
-async def build_war_message() -> tuple[str, bool]:
-    """Fetch current war and return (text, should_keep_updating)."""
-    war = await _coc_safe(coc_client.get_current_war, CLAN_TAG)
-
-    if war is None or war.state == "notInWar":
-        return "🏳️ Клан сейчас не в клановой войне.", False
-
-    if war.state == "preparation":
-        start = war.start_time.time.strftime("%d.%m в %H:%M") if war.start_time else "скоро"
-        return f"⚙️ Идёт подготовка к войне. Бой начнётся {start} (UTC).", False
-
-    attacks_per_member = war.attacks_per_member or 2
-    pending = []
-    for member in war.clan.members:
-        used = len(member.attacks) if member.attacks else 0
-        remaining = attacks_per_member - used
-        if remaining > 0:
-            pending.append((member, used, remaining))
-    pending.sort(key=lambda x: x[1])
-
-    state_label = "⚔️ ВОЙНА ИДЁТ" if war.state == "inWar" else "🏁 ВОЙНА ЗАВЕРШЕНА"
-    our_stars = war.clan.stars
-    their_stars = war.opponent.stars
-
-    time_str = ""
-    if war.state == "inWar" and war.end_time:
-        now = datetime.utcnow()
-        diff = war.end_time.time - now
-        total_sec = max(int(diff.total_seconds()), 0)
-        h, m = divmod(total_sec // 60, 60)
-        time_str = f"\n⏱ До конца: <b>{h}ч {m}мин</b>"
-
-    lines = [
-        f"<b>{state_label}</b>",
-        fmt.DIV,
-        f"🏰 <b>{war.clan.name}</b>  ⚔️  <b>{war.opponent.name}</b>",
-        f"👥 {war.team_size}v{war.team_size}  ·  ⭐ {our_stars} vs {their_stars}" + time_str,
-    ]
-
-    # Attack progress bar
-    total_attacks = war.team_size * attacks_per_member
-    used_attacks  = total_attacks - sum(r for _, _, r in pending)
-    lines.append(f"\n⚔️ Атаки: {fmt.attacks_bar(used_attacks, total_attacks)}  <i>{used_attacks}/{total_attacks}</i>")
-
-    if not pending:
-        lines.append(f"\n{fmt.ok('<b>Все использовали атаки!</b>')}")
-    else:
-        zero_used = [(mb, r) for mb, u, r in pending if u == 0]
-        one_used  = [(mb, r) for mb, u, r in pending if u == 1]
-        tg_map = storage.get_tg_username_map()
-
-        if zero_used:
-            lines.append(f"\n🔴 <b>Нет атак ({len(zero_used)}):</b>")
-            for member, _ in zero_used:
-                tg = tg_map.get(_norm_name(member.name))
-                lines.append(fmt.member_line(member.name, tg=tg))
-
-        if one_used:
-            lines.append(f"\n🟡 <b>Осталась 1 ({len(one_used)}):</b>")
-            for member, _ in one_used:
-                tg = tg_map.get(_norm_name(member.name))
-                lines.append(fmt.member_line(member.name, tg=tg))
-
-    lines.append(fmt.footer())
-    keep_updating = war.state == "inWar"
-    return "\n".join(lines), keep_updating
-
-
-def format_last_seen(last_seen_str: str | None) -> str:
-    if not last_seen_str:
-        return ""
-    try:
-        dt = datetime.fromisoformat(last_seen_str)
-        now = datetime.now()
-        diff = now - dt
-        minutes = int(diff.total_seconds() // 60)
-        if minutes < 1:
-            return " • 🟢 только что"
-        elif minutes < 60:
-            return f" • 🕐 {minutes} мин. назад"
-        elif minutes < 1440:
-            hours = minutes // 60
-            return f" • 🕐 {hours} ч. назад"
-        else:
-            days = minutes // 1440
-            return f" • 💤 {days} дн. назад"
-    except Exception:
-        return ""
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _is_feolar(update: Update) -> bool:
     user = update.effective_user
-    name = user.first_name or "боец"
-
-    # Save chat_id for the war broadcast target when they DM the bot
-    if (update.effective_chat.type == "private"
-            and user.username
-            and user.username.lower() == WAR_NOTIFY_USERNAME.lower()):
-        storage.save_notify_chat(update.effective_chat.id)
-        logger.info(f"Saved war notify chat_id: {update.effective_chat.id}")
-
-    # Fetch live clan data for welcome card
-    try:
-        clan = await _coc_safe(coc_client.get_clan, CLAN_TAG)
-        stats_block = (
-            f"\n{fmt.DIVs}\n\n"
-            f"{fmt.stat_line('Уровень клана', str(clan.level))}\n"
-            f"{fmt.stat_line('Состав', f'{clan.member_count} / 50')}\n"
-            f"{fmt.stat_line('Побед в войнах', str(clan.war_wins))}\n"
-        )
-    except Exception:
-        stats_block = ""
-
-    text = (
-        f"👋 Привет, <b>{name}</b>!\n"
-        f"{fmt.DIV}\n"
-        f"{fmt.clan_header()}\n\n"
-        "<i>Warfil — это не просто клан.\n"
-        "Это боевое братство, где стратегия\n"
-        "и честь важнее, чем числа на экране.\n"
-        "Мы атакуем вместе. Побеждаем достойно.</i>"
-        f"{stats_block}"
-        f"\n{fmt.DIV}\n"
-        "Все команды — в меню ниже 👇\n"
-        f"{fmt.footer()}"
-    )
-
-    inline_kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🌐 Сайт клана", url=CLAN_WEBSITE),
-            InlineKeyboardButton("💬 Беседа клана", url=TG_GROUP_LINK),
-        ]
-    ])
-
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=inline_kb)
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        f"📖 <b>Команды бота Warfil</b>\n"
-        f"{fmt.DIV}\n\n"
-        f"📋 /team\n"
-        f"   Список участников клана\n\n"
-        f"⚔️ /kv\n"
-        f"   Атаки в клановой войне\n\n"
-        f"🏆 /cwl\n"
-        f"   Лига войн клана\n\n"
-        f"📊 /statistic\n"
-        f"   Статистика клана (Excel)\n\n"
-        f"🎨 /card\n"
-        f"   Карточка клана\n\n"
-        f"🔗 /register &lt;ник&gt;\n"
-        f"   Привязать аккаунт CoC\n"
-        f"   <i>Пример: /register WarriorKing</i>\n\n"
-        f"{fmt.DIV}\n"
-        f"🛡 <b>Для администраторов</b>\n\n"
-        f"▸ /link @tg НикВCoC\n"
-        f"▸ /unlink НикВCoC\n"
-        f"▸ /links — все привязки\n"
-        f"{fmt.footer()}"
-    )
-    await update.message.reply_text(text, parse_mode="HTML")
-
-
-async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import unicodedata
-    from html import escape as _esc
-
-    # Берём ник напрямую из текста сообщения — context.args иногда теряет спецсимволы
-    raw_text = update.message.text or ""
-    # Убираем команду (/register или /register@botname) и пробел после неё
-    parts = raw_text.split(None, 1)
-    coc_name_raw = parts[1].strip() if len(parts) > 1 else ""
-
-    if not coc_name_raw:
-        await update.message.reply_text(
-            "Укажи своё имя в игре.\n"
-            "Пример: /register WarriorKing"
-        )
-        return
-
-    # NFC нормализация — обязательна для Unicode никнеймов с со спецсимволами
-    coc_name = unicodedata.normalize("NFC", coc_name_raw)
-
-    user_id = update.effective_user.id
-    tg_username = update.effective_user.username
-    storage.register_player(user_id, coc_name, tg_username)
-    storage.update_last_seen(user_id)
-    linked = f" · @{tg_username}" if tg_username else ""
-    await update.message.reply_text(
-        f"🔗 <b>Аккаунт привязан</b>\n"
-        f"{fmt.DIV}\n\n"
-        f"▸ Ник в игре: <b>{_esc(coc_name)}</b>{linked}\n\n"
-        f"Теперь ты виден в /team со своим Telegram.",
-        parse_mode="HTML"
-    )
-
-
-async def online_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    coc_name = storage.update_last_seen(user_id)
-    if coc_name:
-        await update.message.reply_text(
-            f"✅ <b>{coc_name}</b>, твоя активность отмечена!",
-            parse_mode="HTML"
-        )
-    else:
-        await update.message.reply_text(
-            "Ты ещё не зарегистрирован.\n"
-            "Используй /register <имя в игре> чтобы привязать аккаунт."
-        )
-
-
-async def team_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ Загружаю список клана...")
-    try:
-        clan = await _coc_safe(coc_client.get_clan, CLAN_TAG)
-        members_sorted = sorted(
-            clan.members,
-            key=lambda m: (ROLE_ORDER.get(m.role.value, 9), m.name.lower())
-        )
-
-        # Group members by role (store full member objects)
-        groups: dict[str, list] = defaultdict(list)
-        for member in members_sorted:
-            groups[member.role.value].append(member)
-
-        ROLE_HEADERS = {
-            "leader":   "👑 <b>Лидер</b>",
-            "coLeader": "🔱 <b>Соруководители</b>",
-            "admin":    "🌿 <b>Старейшины</b>",
-            "member":   "🔹 <b>Участники</b>",
-        }
-
-        tg_map = storage.get_tg_username_map()
-
-        lines = [
-            f"🏰 <b>{clan.name}</b>  ·  👥 {clan.member_count}/50",
-            fmt.DIV,
-        ]
-
-        for role_key in ["leader", "coLeader", "admin", "member"]:
-            members = groups.get(role_key)
-            if not members:
-                continue
-            lines.append("")
-            count_str = f"  <i>({len(members)})</i>" if role_key != "leader" else ""
-            lines.append(ROLE_HEADERS[role_key] + count_str)
-            for m in members:
-                tg = tg_map.get(_norm_name(m.name))
-                lines.append(fmt.member_line(m.name, m.town_hall, tg))
-
-        lines.append(f"\n{fmt.footer()}")
-
-        await msg.edit_text("\n".join(lines), parse_mode="HTML")
-
-    except coc.NotFound:
-        await msg.edit_text("❌ Клан не найден. Проверь тег клана.")
-    except Exception as e:
-        logger.error(f"Ошибка при получении данных клана: {e}", exc_info=True)
-        await msg.edit_text("❌ Не удалось загрузить данные. Попробуй позже.")
+    return user is not None and (user.username or "").lower() == ADMIN
 
 
 async def _is_admin(update: Update) -> bool:
-    """True if the sender is a group admin/creator, or if used in a private chat."""
+    """Админ беседы (или личка)."""
     chat = update.effective_chat
-    if chat.type == "private":
+    if chat.type == "private" or _is_feolar(update):
         return True
     member = await chat.get_member(update.effective_user.id)
     return member.status in ("administrator", "creator")
 
 
-# ── Защита доступа ────────────────────────────────────────────────────────────
+def _args(update: Update) -> str:
+    """Текст после команды целиком — context.args теряет спецсимволы ников."""
+    raw = (update.message.text or "").strip()
+    parts = raw.split(None, 1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+async def _deny(update: Update):
+    await fmt.reply(update.message, fmt.err("Эта команда только для администраторов клана."))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Основные команды
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    name = esc(user.first_name or "боец")
+
+    if update.effective_chat.type == "private" and _is_feolar(update):
+        storage.save_notify_chat(update.effective_chat.id)
+
+    stats = ""
+    try:
+        clan = await _coc_safe(coc_client.get_clan, CLAN_TAG)
+        league = getattr(getattr(clan, "war_league", None), "name", None)
+        rows = [
+            line("level", f"Уровень клана <b>{clan.level}</b>"),
+            line("team", f"В составе <b>{clan.member_count}</b> из 50"),
+            line("war", f"Побед в войнах <b>{clan.war_wins}</b>"),
+        ]
+        if league:
+            rows.append(line("cwl", f"Лига войн: <b>{esc(league)}</b>"))
+        stats = "\n\n" + "\n".join(rows)
+    except Exception:
+        pass
+
+    text = (
+        f"{e('hello')} Привет, <b>{name}</b>!\n\n"
+        f"{title('clan', fmt.BRAND)}\n"
+        "<i>Атакуем вместе, побеждаем достойно.</i>"
+        f"{stats}\n\n"
+        "Здесь видно, кто ещё не атаковал в войне, как идёт ЛВК и рейды столицы. "
+        "Все команды — в меню слева от поля ввода."
+    )
+    await fmt.reply(update.message, text, reply_markup=fmt.welcome_buttons())
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "\n".join([
+        title("help", f"Команды бота {fmt.BRAND}"),
+        "",
+        f"{e('war')} /kv — атаки в текущей войне",
+        f"{e('cwl')} /cwl — лига войн кланов",
+        f"{e('capital')} /raid — рейды столицы",
+        f"{e('team')} /team — состав клана",
+        f"{e('stats')} /statistic — статистика в Excel",
+        f"{e('card')} /card — карточка клана",
+        f"{e('link')} /register ник — привязать свой аккаунт",
+        "",
+        "<i>Пример: /register WarriorKing</i>",
+        "",
+        f"{e('admin')} <b>Администраторам</b>",
+        quote([
+            "/link @telegram ник — привязать игрока",
+            "/unlink ник — убрать привязку",
+            "/links — все привязки",
+            "/addchat, /removechat, /listchats — чаты для уведомлений",
+            "/status — проверить, работают ли уведомления",
+            "/emoji, /emojipack, /setemoji — игровые эмодзи",
+        ], fold_after=20),
+    ])
+    await fmt.reply(update.message, text)
+
+
+async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    coc_name_raw = _args(update)
+    if not coc_name_raw:
+        await fmt.reply(update.message, "\n".join([
+            title("link", "Привязка аккаунта"),
+            "",
+            "Напиши ник из игры после команды — так тебя будут отмечать в списках войны.",
+            "<i>Пример: /register WarriorKing</i>",
+        ]))
+        return
+    coc_name = unicodedata.normalize("NFC", coc_name_raw)
+    user = update.effective_user
+    storage.register_player(user.id, coc_name, user.username)
+    storage.update_last_seen(user.id)
+    tg = f" → @{esc(user.username)}" if user.username else ""
+    hint = ("" if user.username else
+            "\n\n" + fmt.warn("У тебя нет @username в Telegram — бот не сможет тебя отметить. "
+                              "Задай его в настройках Telegram и привяжись снова."))
+    await fmt.reply(update.message, fmt.ok(f"Аккаунт привязан: <b>{esc(coc_name)}</b>{tg}") + hint)
+
+
+async def online_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    coc_name = storage.update_last_seen(update.effective_user.id)
+    if coc_name:
+        await fmt.reply(update.message, fmt.ok(f"<b>{esc(coc_name)}</b>, отметил тебя в сети."))
+    else:
+        await fmt.reply(update.message, fmt.warn("Сначала привяжи аккаунт: /register ник"))
+
+
+async def team_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await fmt.reply(update.message, line("time", "Загружаю состав клана…"))
+    try:
+        clan = await _coc_safe(coc_client.get_clan, CLAN_TAG)
+        groups: dict[str, list] = defaultdict(list)
+        for m in sorted(clan.members, key=lambda m: (ROLE_ORDER.get(m.role.value, 9), m.name.lower())):
+            groups[m.role.value].append(m)
+
+        role_titles = {
+            "leader": ("leader", "Глава"),
+            "coLeader": ("coleader", "Соруководители"),
+            "admin": ("elder", "Старейшины"),
+            "member": ("member", "Участники"),
+        }
+        tg_map = storage.get_tg_username_map()
+        lines = [title("clan", esc(clan.name)), line("team", f"{clan.member_count} из 50")]
+        for role in ("leader", "coLeader", "admin", "member"):
+            members = groups.get(role)
+            if not members:
+                continue
+            key, label = role_titles[role]
+            count = f": {len(members)}" if role != "leader" else ""
+            rows = [fmt.player(m.name, m.town_hall, tg_map.get(_norm_name(m.name))) for m in members]
+            lines.append(f"\n{e(key)} <b>{label}{count}</b>\n{quote(rows, fold_after=15)}")
+        await fmt.edit(msg, "\n".join(lines), reply_markup=fmt.clan_buttons())
+    except coc.NotFound:
+        await fmt.edit(msg, fmt.err(f"Клан {CLAN_TAG} не найден. Проверь CLAN_TAG в .env."))
+    except Exception as exc:
+        logger.error(f"/team: {exc}", exc_info=True)
+        await fmt.edit(msg, fmt.err("CoC API не ответил. Попробуй через пару минут."))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Доступ
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def _clan_group_id(bot) -> int | None:
-    """Return the registered clan group chat ID (constant or first notify chat)."""
-    if CLAN_GROUP_CHAT_ID:
-        return CLAN_GROUP_CHAT_ID
-    chats = storage.get_notify_chats()
-    # Return only if it's actually a group (negative ID in Telegram)
-    for cid in chats:
+    if config.CLAN_GROUP_CHAT_ID:
+        return config.CLAN_GROUP_CHAT_ID
+    for cid in storage.get_notify_chats():
         if cid < 0:
             return cid
     return None
 
 
 async def clan_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Security gate — registered in group=-1, runs before every command/message.
-
-    Rules:
-    • Group / supergroup: only the registered clan group is served, all others are silently ignored.
-    • Private chat: only users who are members of the clan group may use the bot;
-      others receive a rejection message with the clan website link.
-    • Bot admin (@feolar) is always allowed everywhere.
-    """
+    """Выполняется до всех команд: бот работает только в беседе клана
+    и в личке у её участников. Админ бота проходит всегда."""
     if not update.effective_chat or not update.effective_user:
         return
-
-    chat = update.effective_chat
-    user = update.effective_user
-
-    # Bot admin bypass — always allow
-    if (user.username or "").lower() == WAR_NOTIFY_USERNAME.lower():
+    chat, user = update.effective_chat, update.effective_user
+    if (user.username or "").lower() == ADMIN:
         return
-
     gid = await _clan_group_id(context.bot)
 
-    # ── Группы: только беседа клана ──────────────────────────────────────────
     if chat.type in ("group", "supergroup"):
         if gid and chat.id != gid:
-            raise ApplicationHandlerStop  # чужая беседа — молча игнорируем
-        return  # своя беседа — разрешаем
+            raise ApplicationHandlerStop
+        return
 
-    # ── Личные сообщения: проверяем членство в беседе клана ──────────────────
-    if chat.type == "private":
-        if not gid:
-            return  # защита ещё не настроена (addchat не запускали)
-
-        allowed = False
+    if chat.type == "private" and gid:
         try:
             member = await context.bot.get_chat_member(gid, user.id)
             allowed = member.status not in ("left", "kicked", "banned")
         except Exception:
-            allowed = False  # не удалось проверить → блокируем
-
+            allowed = False
         if not allowed:
             if update.message:
-                await update.message.reply_text(
-                    "👋 <b>Вы не являетесь участником беседы клана Warfil.</b>\n\n"
-                    "Для вступления в клан перейдите по ссылке:\n"
-                    f"🌐 {CLAN_WEBSITE}\n\n"
-                    "и подайте анкету на вступление в клан.",
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
+                await fmt.reply(update.message, "\n".join([
+                    title("clan", f"Бот только для клана {fmt.BRAND}"),
+                    "",
+                    "Ты пока не в беседе клана. Заполни анкету на сайте — после вступления бот откроется.",
+                ]), reply_markup=fmt.welcome_buttons())
             raise ApplicationHandlerStop
 
 
-async def link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /link @tg_username Ник в CoC"""
-    from html import escape as _esc
-    import unicodedata
+# ══════════════════════════════════════════════════════════════════════════════
+#  Привязки (админ)
+# ══════════════════════════════════════════════════════════════════════════════
 
+async def link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
         return
-
     try:
         try:
-            is_admin = await _is_admin(update)
+            allowed = await _is_admin(update)
         except Exception:
-            is_admin = True  # при ошибке проверки — разрешаем (ЛС/ошибка API)
-
-        if not is_admin:
-            await msg.reply_text("❌ Только администраторы могут использовать эту команду.")
+            allowed = True
+        if not allowed:
+            await _deny(update)
             return
-
-        # Парсим полный текст — context.args может терять спецсимволы и mentions
-        raw = (msg.text or "").strip()
-        # Убираем команду (/link или /link@botname)
-        body = raw.split(None, 1)[1].strip() if len(raw.split(None, 1)) > 1 else ""
-
-        if not body:
-            await msg.reply_text(
-                "Использование: /link @telegram НикВCoC\n"
-                "Примеры:\n"
-                "  /link @feolar Fanon\n"
-                "  /link @feolar ɢʀᴇꜱʜɴɪᴋ⇝ ™\n\n"
-                "Один @telegram можно привязать к нескольким никам."
-            )
-            return
-
-        # body = "@username ник" — разбиваем на части
-        parts = body.split(None, 1)
+        parts = _args(update).split(None, 1)
         if len(parts) < 2:
-            await msg.reply_text(
-                "Укажи оба аргумента.\n"
-                "Пример: /link @feolar Fanon"
-            )
+            await fmt.reply(msg, "\n".join([
+                title("link", "Привязать игрока"),
+                "",
+                "/link @telegram ник в игре",
+                quote(["/link @feolar Fanon", "/link @feolar ɢʀᴇꜱʜɴɪᴋ⇝ ™"]),
+                "Один @telegram можно привязать к нескольким никам — для твинков.",
+            ]))
             return
-
         tg_username = parts[0].lstrip("@")
         coc_name = unicodedata.normalize("NFC", parts[1].strip())
-
         storage.link_player(coc_name, tg_username)
         logger.info(f"Привязка: {coc_name!r} → @{tg_username}")
-        await msg.reply_text(
-            f"✅ <b>{_esc(coc_name)}</b> привязан к @{tg_username}",
-            parse_mode="HTML"
-        )
-
-    except Exception as e:
-        logger.error(f"Ошибка /link: {e}", exc_info=True)
-        await msg.reply_text(f"❌ Ошибка: {e}")
+        await fmt.reply(msg, fmt.ok(f"<b>{esc(coc_name)}</b> привязан к @{esc(tg_username)}"))
+    except Exception as exc:
+        logger.error(f"/link: {exc}", exc_info=True)
+        await fmt.reply(msg, fmt.err(f"Не сохранил привязку: {esc(exc)}"))
 
 
 async def unlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /unlink Ник в CoC"""
-    from html import escape as _esc
-    import unicodedata
-
     msg = update.message
     if not msg:
         return
-
     try:
         try:
-            is_admin = await _is_admin(update)
+            allowed = await _is_admin(update)
         except Exception:
-            is_admin = True
-
-        if not is_admin:
-            await msg.reply_text("❌ Только администраторы могут использовать эту команду.")
+            allowed = True
+        if not allowed:
+            await _deny(update)
             return
-
-        raw = (msg.text or "").strip()
-        body = raw.split(None, 1)[1].strip() if len(raw.split(None, 1)) > 1 else ""
-
+        body = _args(update)
         if not body:
-            await msg.reply_text("Использование: /unlink НикВCoC\nПример: /unlink Fanon")
+            await fmt.reply(msg, "Укажи ник из игры: <code>/unlink Fanon</code>")
             return
-
         coc_name = unicodedata.normalize("NFC", body)
-        removed = storage.unlink_player(coc_name)
-        if removed:
-            await msg.reply_text(f"✅ Привязка для <b>{_esc(coc_name)}</b> удалена.", parse_mode="HTML")
+        if storage.unlink_player(coc_name):
+            await fmt.reply(msg, fmt.ok(f"Привязка <b>{esc(coc_name)}</b> удалена."))
         else:
-            await msg.reply_text(f"⚠️ Привязка для <b>{_esc(coc_name)}</b> не найдена.", parse_mode="HTML")
-
-    except Exception as e:
-        logger.error(f"Ошибка /unlink: {e}", exc_info=True)
-        await msg.reply_text(f"❌ Ошибка: {e}")
+            await fmt.reply(msg, fmt.warn(f"Привязки для <b>{esc(coc_name)}</b> нет — проверь написание ника в /links."))
+    except Exception as exc:
+        logger.error(f"/unlink: {exc}", exc_info=True)
+        await fmt.reply(msg, fmt.err(f"Не удалил привязку: {esc(exc)}"))
 
 
 async def links_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show all current links (admin only)."""
     if not await _is_admin(update):
-        await update.message.reply_text("❌ Только администраторы могут использовать эту команду.")
+        await _deny(update)
         return
-
     all_links = storage.get_all_links()
     if not all_links:
-        await update.message.reply_text("Привязок пока нет. Используй /link @telegram НикВCoC")
+        await fmt.reply(update.message, "Привязок пока нет. Добавь первую: <code>/link @telegram ник</code>")
         return
+    rows = [f"<b>{esc(n)}</b> → @{esc(u)}" for n, u in sorted(all_links.items(), key=lambda x: x[1].lower())]
+    await fmt.reply(update.message, f"{title('link', f'Привязки: {len(rows)}')}\n{quote(rows, fold_after=20)}")
 
-    lines = ["📋 <b>Текущие привязки:</b>", ""]
-    for coc_name, tg_user in sorted(all_links.items(), key=lambda x: x[1]):
-        lines.append(f"  {coc_name} → @{tg_user}")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Война / ЛВК / рейды — команды
+# ══════════════════════════════════════════════════════════════════════════════
+
+KV_REFRESH_SECONDS = 60
+KV_REFRESH_LIMIT = 30   # не дольше 30 минут
 
 
 async def kv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-
-    # Cancel any existing auto-update task for this chat
     existing = _kv_tasks.get(chat_id)
     if existing and not existing.done():
         existing.cancel()
 
-    msg = await update.message.reply_text("⏳ Загружаю данные войны...")
-
+    msg = await fmt.reply(update.message, line("time", "Загружаю данные войны…"))
     try:
-        text, keep_updating = await build_war_message()
-        await msg.edit_text(text, parse_mode="HTML", reply_markup=KV_BUTTONS)
+        war = await _coc_safe(coc_client.get_current_war, CLAN_TAG)
+        text, keep = views.war_status(war)
+        await fmt.edit(msg, text, reply_markup=fmt.clan_buttons())
     except coc.PrivateWarLog:
-        await msg.edit_text("🔒 Журнал войны клана закрыт.")
+        await fmt.edit(msg, fmt.err("Журнал войн клана закрыт. Открыть его может глава в настройках клана."))
         return
     except coc.NotFound:
-        await msg.edit_text("❌ Клан не найден.")
+        await fmt.edit(msg, fmt.err(f"Клан {CLAN_TAG} не найден."))
         return
-    except Exception as e:
-        logger.error(f"Ошибка /kv: {e}")
-        await msg.edit_text("❌ Не удалось загрузить данные войны. Попробуй позже.")
+    except Exception as exc:
+        logger.error(f"/kv: {exc}", exc_info=True)
+        await fmt.edit(msg, fmt.err("CoC API не ответил. Попробуй через пару минут."))
         return
-
-    if not keep_updating:
+    if not keep:
         return
 
     async def auto_update():
-        while True:
-            await asyncio.sleep(5)
+        last = text
+        for _ in range(KV_REFRESH_LIMIT):
+            await asyncio.sleep(KV_REFRESH_SECONDS)
             try:
-                new_text, still_going = await build_war_message()
-                try:
-                    await msg.edit_text(new_text, parse_mode="HTML", reply_markup=KV_BUTTONS)
-                except Exception:
-                    pass  # Message not modified or deleted — skip silently
-                if not still_going:
+                w = await _coc_safe(coc_client.get_current_war, CLAN_TAG)
+                new_text, still = views.war_status(w)
+                if new_text != last:
+                    await fmt.edit(msg, new_text, reply_markup=fmt.clan_buttons())
+                    last = new_text
+                if not still:
                     break
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.warning(f"Ошибка авто-обновления /kv: {e}")
+            except Exception:
                 break
 
     task = asyncio.create_task(auto_update())
     _kv_tasks[chat_id] = task
 
 
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    # Route reply-keyboard button presses to the right commands
-    if text == "📋 Список клана":
-        await team_command(update, context)
-    elif text == "❓ Помощь":
-        await help_command(update, context)
-    elif text == "🔗 Привязать аккаунт":
-        await update.message.reply_text(
-            "Чтобы привязать свой аккаунт, напиши:\n"
-            "/register &lt;твой ник в CoC&gt;\n\n"
-            "<i>Пример: /register WarriorKing</i>",
-            parse_mode="HTML"
-        )
-    else:
-        pass  # ignore other text messages
-
-
-async def send_war_start(bot, chat_id: int, war):
-    opponent = war.opponent.name if war.opponent else "противника"
-    text = (
-        f"⚔️ <b>ВОЙНА НАЧАЛАСЬ!</b>\n"
-        f"{fmt.DIV}\n\n"
-        f"🏰 <b>Warfil</b>  vs  <b>{opponent}</b>\n"
-        f"👥 {war.team_size} на {war.team_size}\n\n"
-        f"{fmt.DIVs}\n"
-        f"💥 Боевой день открыт!\n"
-        f"▸ Атакуйте с умом\n"
-        f"▸ Сражайтесь с честью\n\n"
-        f"<b>Удачи бойцам Warfil! 💪</b>"
-    )
-    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=KV_BUTTONS)
-
-
-async def send_war_end(bot, chat_id: int, war):
-    attacks_per_member = war.attacks_per_member or 2
-    tg_map = storage.get_tg_username_map()
-
-    attacked = []
-    missed = []
-    for member in war.clan.members:
-        used = len(member.attacks) if member.attacks else 0
-        if used >= attacks_per_member:
-            attacked.append(member)
+async def cwl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await fmt.reply(update.message, line("time", "Загружаю лигу войн…"))
+    try:
+        group, wars = await notifier.cwl_wars()
+        if group is None:
+            text = "\n".join([title("cwl", "Лига войн кланов"), "",
+                              "Сейчас клан не в ЛВК. Сезон начинается в первых числах месяца — "
+                              "бот объявит каждый раунд."])
         else:
-            missed.append((member, used))
-
-    our_stars = war.clan.stars
-    their_stars = war.opponent.stars
-    if our_stars > their_stars:
-        result_line = "🏆 <b>Победа!</b>"
-    elif our_stars < their_stars:
-        result_line = "😔 <b>Поражение.</b>"
-    else:
-        result_line = "🤝 <b>Ничья.</b>"
-
-    lines = [
-        f"🏁 <b>ВОЙНА ЗАВЕРШЕНА</b>",
-        fmt.DIV,
-        f"🏰 <b>Warfil</b>  vs  <b>{war.opponent.name}</b>",
-        f"⭐ {our_stars}  vs  {their_stars}  ·  {result_line}",
-    ]
-
-    if attacked:
-        lines.append(f"\n✅ <b>Атаковали ({len(attacked)}):</b>")
-        for member in attacked:
-            tg = tg_map.get(_norm_name(member.name))
-            lines.append(fmt.member_line(member.name, tg=tg))
-        lines.append("\n🔥 <i>Молодцы! Вы — гордость клана!</i>")
-
-    if missed:
-        lines.append(f"\n❌ <b>Не атаковали ({len(missed)}):</b>")
-        for member, used in missed:
-            tg = tg_map.get(_norm_name(member.name))
-            used_str = f" ({used}/{attacks_per_member})" if used > 0 else ""
-            lines.append(fmt.member_line(f"{member.name}{used_str}", tg=tg))
-        lines.append(f"\n{fmt.warn('<b>Игроки без атак — кандидаты на кик!</b>')}")
-
-    # Save stats for Excel
-    result_str = "win" if our_stars > their_stars else ("lose" if our_stars < their_stars else "tie")
-    end_str = war.end_time.time.strftime("%Y-%m-%dT%H:%M:%S") if war.end_time else ""
-    member_stats = []
-    for member in war.clan.members:
-        used = len(member.attacks) if member.attacks else 0
-        member_stats.append({"name": member.name, "attacks_used": used, "attacks_max": attacks_per_member})
-    stats_storage.save_war_result(
-        end_time=end_str, opponent=war.opponent.name,
-        result=result_str, our_stars=our_stars, their_stars=their_stars,
-        team_size=war.team_size, attacks_per_member=attacks_per_member,
-        members=member_stats,
-    )
-
-    await bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="HTML", reply_markup=KV_BUTTONS)
+            text, _ = views.cwl_status(group.season, wars)
+        await fmt.edit(msg, text, reply_markup=fmt.clan_buttons())
+    except Exception as exc:
+        logger.error(f"/cwl: {exc}", exc_info=True)
+        await fmt.edit(msg, fmt.err("CoC API не ответил. Попробуй через пару минут."))
 
 
-async def _try_save_war_ended(war):
-    """If war is warEnded and not yet saved locally, save it now."""
-    if not war or war.state != "warEnded":
-        return
+async def raid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await fmt.reply(update.message, line("time", "Загружаю рейды столицы…"))
     try:
-        clan_tag_clean = CLAN_TAG.lstrip("#").upper()
-        our = war.clan if war.clan.tag.lstrip("#").upper() == clan_tag_clean else war.opponent
-        opp = war.opponent if our is war.clan else war.clan
-        end_iso = war.end_time.time.isoformat() if war.end_time else ""
-        if not end_iso:
-            return
-        existing = stats_storage.get_war_history()
-        if any(w.get("end_time", "")[:16] == end_iso[:16] for w in existing):
-            return  # already saved
-        # Determine result
-        if our.stars > opp.stars:
-            result = "win"
-        elif our.stars < opp.stars:
-            result = "lose"
-        elif (our.destruction or 0) > (opp.destruction or 0):
-            result = "win"
-        elif (our.destruction or 0) < (opp.destruction or 0):
-            result = "lose"
-        else:
-            result = "tie"
-        members = []
-        for m in (our.members or []):
-            members.append({
-                "name": m.name,
-                "th": getattr(m, "town_hall", 0),
-                "attacks_used": len(m.attacks) if m.attacks else 0,
-                "attacks_max": war.attacks_per_member,
-            })
-        stats_storage.save_war_result(
-            end_time=end_iso,
-            opponent=opp.name,
-            result=result,
-            our_stars=our.stars,
-            their_stars=opp.stars,
-            team_size=war.team_size,
-            attacks_per_member=war.attacks_per_member,
-            members=members,
-        )
-        logger.info(f"Auto-saved warEnded: vs {opp.name} at {end_iso[:10]}")
-    except Exception as e:
-        logger.warning(f"_try_save_war_ended: {e}")
+        raid = await notifier.current_raid()
+        text, _ = views.raid_status(raid)
+        await fmt.edit(msg, text)
+    except Exception as exc:
+        logger.error(f"/raid: {exc}", exc_info=True)
+        await fmt.edit(msg, fmt.err("CoC API не ответил. Попробуй через пару минут."))
 
 
-async def war_state_monitor(bot):
-    """Poll war state every 60 s; send messages on transitions."""
-    previous_state = storage.get_war_state()  # restore across restarts
-
-    # On startup: if war is already ended, save data immediately (bot may have missed the transition)
-    try:
-        startup_war = await _coc_safe(coc_client.get_current_war, CLAN_TAG)
-        if startup_war and startup_war.state == "warEnded":
-            await _try_save_war_ended(startup_war)
-    except Exception:
-        pass
-
-    while True:
-        await asyncio.sleep(60)
-        try:
-            chat_ids = storage.get_notify_chats()
-            if not chat_ids:
-                continue
-
-            war = await _coc_safe(coc_client.get_current_war, CLAN_TAG)
-            current_state = war.state.value if war and war.state else "notInWar"
-
-            if previous_state is not None and previous_state != current_state:
-                for chat_id in chat_ids:
-                    try:
-                        if previous_state == "preparation" and current_state == "inWar":
-                            await send_war_start(bot, chat_id, war)
-                        elif previous_state == "inWar" and current_state == "warEnded":
-                            await send_war_end(bot, chat_id, war)
-                    except Exception as e:
-                        logger.warning(f"war_state_watcher: ошибка отправки в {chat_id}: {e}")
-
-            # Also auto-save if we see warEnded state (belt-and-suspenders)
-            if current_state == "warEnded":
-                await _try_save_war_ended(war)
-
-            if current_state != previous_state:
-                storage.save_war_state(current_state)
-                previous_state = current_state
-
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.warning(f"war_state_monitor: {e}")
-
-
-async def war_auto_broadcast(bot):
-    """Send a new war status message to WAR_NOTIFY_CHAT every 7200 seconds while war is active."""
-    while True:
-        await asyncio.sleep(7200)  # 2 часа — ждём СНАЧАЛА, чтобы не слать при каждом перезапуске
-        try:
-            chat_ids = storage.get_notify_chats()
-            if not chat_ids:
-                logger.debug("war_auto_broadcast: chat_ids not set yet, waiting...")
-                continue
-            text, keep_going = await build_war_message()
-            if keep_going:
-                for chat_id in chat_ids:
-                    try:
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text=text,
-                            parse_mode="HTML",
-                            reply_markup=KV_BUTTONS,
-                        )
-                    except Exception as e:
-                        logger.warning(f"war_auto_broadcast: ошибка отправки в {chat_id}: {e}")
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.warning(f"war_auto_broadcast: {e}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  CAPITAL RAIDS  —  рейды столицы клана
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def _get_current_raid():
-    """Fetch the most recent raid log entry. Returns None if no raids found."""
-    try:
-        raid_log = await _coc_safe(coc_client.get_raid_log, CLAN_TAG, limit=1)
-        async for entry in raid_log:
-            return entry
-    except Exception:
-        pass
-    return None
-
-
-async def build_raid_message() -> tuple[str, bool]:
-    """Build capital raid status message. Returns (text, keep_updating)."""
-    raid = await _get_current_raid()
-
-    if raid is None:
-        return "🏛 Нет данных о рейдах столицы.", False
-
-    state = getattr(raid, "state", "ended")
-    if state != "ongoing":
-        return "🏛 Рейды столицы сейчас не идут.", False
-
-    total_loot = getattr(raid, "total_loot", 0) or 0
-    members = list(getattr(raid, "members", None) or [])
-    attack_count = getattr(raid, "attack_count", 0) or 0
-    districts_destroyed = getattr(raid, "enemy_districts_destroyed", 0) or 0
-
-    time_str = ""
-    if getattr(raid, "end_time", None):
-        from datetime import datetime as _dt
-        diff = raid.end_time.time - _dt.utcnow()
-        total_sec = max(int(diff.total_seconds()), 0)
-        h, m = divmod(total_sec // 60, 60)
-        time_str = f"⏱ До конца: <b>{h}ч {m}мин</b>\n"
-
-    start_str = ""
-    if getattr(raid, "start_time", None):
-        start_str = f"🗓 Начались: <b>{raid.start_time.time.strftime('%d.%m')}</b>\n"
-
-    # Sort members by loot descending
-    members_sorted = sorted(
-        members,
-        key=lambda m: getattr(m, "capital_resources_looted", 0) or 0,
-        reverse=True,
-    )
-
-    tg_map = storage.get_tg_username_map()
-
-    lines = [
-        "🏛 <b>РЕЙДЫ СТОЛИЦЫ ИДУТ</b>",
-        fmt.DIV,
-        start_str + time_str +
-        f"💰 Собрано: <b>{total_loot:,}".replace(",", " ") + " золота</b>\n"
-        f"⚔️ Атак: <b>{attack_count}</b>  ·  🏰 Районов взято: <b>{districts_destroyed}</b>",
-    ]
-
-    if members_sorted:
-        lines.append(f"\n👥 <b>Участников: {len(members_sorted)}</b>")
-        for i, m in enumerate(members_sorted[:10], 1):
-            name = getattr(m, "name", "?")
-            loot = getattr(m, "capital_resources_looted", 0) or 0
-            atks = getattr(m, "attacks", 0) or 0
-            atk_limit = (getattr(m, "attack_limit", 5) or 5) + (getattr(m, "bonus_attack_limit", 0) or 0)
-            tg = tg_map.get(_norm_name(name))
-            tag = f" (@{tg})" if tg else ""
-            lines.append(f"  {i}. {name}{tag} — {loot:,}💎 · {atks}/{atk_limit}atk".replace(",", " "))
-
-    lines.append(fmt.footer())
-    return "\n".join(lines), True
-
-
-async def send_raid_start(bot, chat_id: int, raid):
-    """Notification when raid weekend begins."""
-    start_str = ""
-    if getattr(raid, "end_time", None):
-        start_str = f"⏳ Закончатся: {raid.end_time.time.strftime('%d.%m в %H:%M')} (UTC)\n"
-
-    text = (
-        f"🏛 <b>РЕЙДЫ СТОЛИЦЫ НАЧАЛИСЬ!</b>\n"
-        f"{fmt.DIV}\n\n"
-        f"{start_str}\n"
-        f"{fmt.DIVs}\n"
-        f"💎 Время грабить вражескую столицу!\n"
-        f"▸ У каждого минимум <b>5 атак</b>\n"
-        f"▸ Сначала добиваем незавершённые районы\n"
-        f"▸ Не теряем ни одной атаки!\n\n"
-        f"<b>Warfil — в атаку! 💪</b>"
-    )
-    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-
-
-async def send_raid_end(bot, chat_id: int, raid):
-    """Notification when raid weekend ends with summary."""
-    total_loot = getattr(raid, "total_loot", 0) or 0
-    off_reward = getattr(raid, "offensive_reward", 0) or 0
-    def_reward = getattr(raid, "defensive_reward", 0) or 0
-    attack_count = getattr(raid, "attack_count", 0) or 0
-    districts = getattr(raid, "enemy_districts_destroyed", 0) or 0
-    members = list(getattr(raid, "members", None) or [])
-
-    members_sorted = sorted(
-        members,
-        key=lambda m: getattr(m, "capital_resources_looted", 0) or 0,
-        reverse=True,
-    )
-    tg_map = storage.get_tg_username_map()
-
-    # Кто не атаковал вообще
-    try:
-        clan = await _coc_safe(coc_client.get_clan, CLAN_TAG)
-        clan_names = {_norm_name(m.name) for m in (clan.members or [])}
-        raided_names = {_norm_name(getattr(m, "name", "")) for m in members}
-        missed_names = clan_names - raided_names
-    except Exception:
-        missed_names = set()
-
-    lines = [
-        "🏁 <b>РЕЙДЫ СТОЛИЦЫ ЗАВЕРШЕНЫ</b>",
-        fmt.DIV,
-        f"💰 Собрано: <b>{total_loot:,}".replace(",", " ") + " золота</b>",
-        f"⚔️ Атак: <b>{attack_count}</b>  ·  🏰 Районов взято: <b>{districts}</b>",
-        f"🎁 Награда: <b>{off_reward}</b> атак. / <b>{def_reward}</b> защ.",
-    ]
-
-    if members_sorted:
-        lines.append(f"\n✅ <b>Атаковали ({len(members_sorted)}):</b>")
-        for m in members_sorted:
-            name = getattr(m, "name", "?")
-            loot = getattr(m, "capital_resources_looted", 0) or 0
-            atks = getattr(m, "attacks", 0) or 0
-            atk_limit = (getattr(m, "attack_limit", 5) or 5) + (getattr(m, "bonus_attack_limit", 0) or 0)
-            tg = tg_map.get(_norm_name(name))
-            lines.append(fmt.member_line(f"{name} — {loot:,}💎 · {atks}/{atk_limit}atk".replace(",", " "), tg=tg))
-        lines.append(f"\n🔥 <i>Отличная работа, участники!</i>")
-
-    if missed_names:
-        lines.append(f"\n❌ <b>Не участвовали ({len(missed_names)}):</b>")
-        for norm in sorted(missed_names):
-            tg = tg_map.get(norm)
-            display = norm
-            for m in members_sorted:
-                if _norm_name(getattr(m, "name", "")) == norm:
-                    display = m.name
-                    break
-            lines.append(fmt.member_line(display, tg=tg))
-        lines.append(f"\n{fmt.warn('<b>Без рейда — кандидаты на проверку!</b>')}")
-
-    lines.append(fmt.footer())
-    await bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="HTML")
-
-
-async def raid_state_monitor(bot):
-    """Poll capital raid state every 5 min; notify on start/end transitions."""
-    saved = storage.get_raid_state()
-    prev_state = saved.get("state", "ended")
-    prev_start = saved.get("start_iso", "")
-
-    while True:
-        await asyncio.sleep(300)  # 5 минут
-        try:
-            chat_ids = storage.get_notify_chats()
-            if not chat_ids:
-                continue
-
-            raid = await _get_current_raid()
-            if raid is None:
-                continue
-
-            current_state = getattr(raid, "state", "ended")
-            current_start = ""
-            if getattr(raid, "start_time", None):
-                current_start = raid.start_time.time.isoformat()
-
-            # Определяем переход состояния по state и start_time (чтобы не слать повторно)
-            new_raid_started = (
-                current_state == "ongoing"
-                and (prev_state == "ended" or current_start != prev_start)
-            )
-            raid_ended = (prev_state == "ongoing" and current_state == "ended")
-
-            if new_raid_started:
-                for chat_id in chat_ids:
-                    try:
-                        await send_raid_start(bot, chat_id, raid)
-                    except Exception as e:
-                        logger.warning(f"raid_monitor: ошибка отправки в {chat_id}: {e}")
-
-            elif raid_ended:
-                for chat_id in chat_ids:
-                    try:
-                        await send_raid_end(bot, chat_id, raid)
-                    except Exception as e:
-                        logger.warning(f"raid_monitor: ошибка отправки в {chat_id}: {e}")
-
-            if current_state != prev_state or current_start != prev_start:
-                storage.save_raid_state(current_state, current_start)
-                prev_state = current_state
-                prev_start = current_start
-
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.warning(f"raid_state_monitor: {e}")
-
-
-async def raid_auto_broadcast(bot):
-    """Send raid status every 4 hours while raid is active."""
-    while True:
-        await asyncio.sleep(14400)  # 4 часа
-        try:
-            chat_ids = storage.get_notify_chats()
-            if not chat_ids:
-                continue
-            text, keep_going = await build_raid_message()
-            if keep_going:
-                for chat_id in chat_ids:
-                    try:
-                        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-                    except Exception as e:
-                        logger.warning(f"raid_auto_broadcast: ошибка отправки в {chat_id}: {e}")
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.warning(f"raid_auto_broadcast: {e}")
-
-
-def _is_feolar(update: Update) -> bool:
-    user = update.effective_user
-    return user is not None and (user.username or "").lower() == WAR_NOTIFY_USERNAME.lower()
-
-
-async def teststart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _test_send(update: Update, coro_text):
     if not _is_feolar(update):
-        await update.message.reply_text("❌ Нет доступа.")
+        await _deny(update)
         return
     try:
-        war = await _coc_safe(coc_client.get_current_war, CLAN_TAG)
-        if war is None or war.state == "notInWar":
-            await update.message.reply_text("⚠️ Клан не в войне — нет данных для теста.")
+        text = await coro_text()
+        if not text:
+            await fmt.reply(update.message, fmt.warn("Сейчас нет подходящих данных для этого сообщения."))
             return
-        await send_war_start(context.bot, update.effective_chat.id, war)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+        await fmt.reply(update.message, text, reply_markup=fmt.clan_buttons())
+    except Exception as exc:
+        logger.error(f"test: {exc}", exc_info=True)
+        await fmt.reply(update.message, fmt.err(esc(exc)))
 
 
-async def testend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_feolar(update):
-        await update.message.reply_text("❌ Нет доступа.")
-        return
-    try:
-        war = await _coc_safe(coc_client.get_current_war, CLAN_TAG)
-        if war is None or war.state == "notInWar":
-            await update.message.reply_text("⚠️ Клан не в войне — нет данных для теста.")
-            return
-        await send_war_end(context.bot, update.effective_chat.id, war)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+async def _war_or_none():
+    w = await _coc_safe(coc_client.get_current_war, CLAN_TAG)
+    return None if w is None or w.state == "notInWar" else w
+
+
+async def teststart_command(update, context):
+    async def t():
+        w = await _war_or_none()
+        return w and (views.war_found(w) if w.state == "preparation" else views.war_started(w))
+    await _test_send(update, t)
+
+
+async def testend_command(update, context):
+    async def t():
+        w = await _war_or_none()
+        return w and views.war_ended(w)
+    await _test_send(update, t)
+
+
+async def testremind_command(update, context):
+    async def t():
+        w = await _war_or_none()
+        return w and (views.war_reminder(w) or fmt.ok("Все атаки сделаны — напоминание не нужно."))
+    await _test_send(update, t)
+
+
+async def _cwl_pick(state: str | None = None):
+    group, wars = await notifier.cwl_wars()
+    picked = [(n, w) for n, w in wars if state is None or w.state == state]
+    return picked[-1] if picked else (None, None)
+
+
+async def testcwlstart_command(update, context):
+    async def t():
+        n, w = await _cwl_pick("inWar")
+        return w and views.cwl_started(w, n)
+    await _test_send(update, t)
+
+
+async def testcwlend_command(update, context):
+    async def t():
+        n, w = await _cwl_pick("warEnded")
+        return w and views.cwl_ended(w, n)
+    await _test_send(update, t)
+
+
+async def testraidstart_command(update, context):
+    async def t():
+        r = await notifier.current_raid()
+        return r and views.raid_started(r)
+    await _test_send(update, t)
+
+
+async def testraidend_command(update, context):
+    async def t():
+        r = await notifier.current_raid()
+        return r and views.raid_summary(r, await notifier.clan_members())
+    await _test_send(update, t)
 
 
 async def statistic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ Собираю статистику, подождите...")
+    msg = await fmt.reply(update.message, fmt.line("stats", "Собираю статистику за последние войны, ЛВК и рейды…"))
     try:
         clan_tag_clean = CLAN_TAG.lstrip("#").upper()
 
@@ -1387,8 +550,8 @@ async def statistic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if opp_name:
                     player_by_opp[opp_name] = members_live
                 # Auto-save warEnded war if not already saved
-                if cw.state == "warEnded":
-                    await _try_save_war_ended(cw)
+                if cw.state == "warEnded" and not cw.is_cwl:
+                    notifier._save_war_history(cw)
         except Exception as e:
             logger.warning(f"Текущая КВ: {e}")
 
@@ -1493,348 +656,24 @@ async def statistic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=buf,
             filename="warfil_statistics.xlsx",
-            caption=(
-                f"📊 <b>Статистика Warfil</b>\n"
-                f"{fmt.DIV}\n\n"
-                f"⚔️ КВ — {len(war_history)} войн\n"
-                f"🏆 ЛВК — {len(cwl_seasons)} сезон(а), {n_cwl_rounds} раундов\n"
-                f"🏛 Рейды столицы — последний рейд\n"
-                f"{fmt.footer()}"
+            caption=game_emoji.strip_custom(
+                f"{fmt.title('stats', f'Статистика {fmt.BRAND}')}\n\n"
+                f"{fmt.line('war', f'Клановые войны: {len(war_history)}')}\n"
+                f"{fmt.line('cwl', f'ЛВК: сезонов {len(cwl_seasons)}, раундов {n_cwl_rounds}')}\n"
+                f"{fmt.line('capital', 'Рейды столицы: последний уикенд')}"
             ),
             parse_mode="HTML",
         )
         await msg.delete()
     except Exception as e:
         logger.error(f"Ошибка /statistic: {e}", exc_info=True)
-        await msg.edit_text("❌ Не удалось сгенерировать файл. Попробуй позже.")
+        await fmt.edit(msg, fmt.err("Не получилось собрать файл: CoC API не ответил. Попробуй через пару минут."))
 
+CARD_BACKGROUNDS = ["card_background.png", "card_bg_2.png", "card_bg_3.png", "card_bg_4.png"]
 
-async def get_cwl_clan_war(war_round=coc.WarRound.current_war):
-    """Return (war, group, round_num) for our clan in the requested CWL round, or (None, group, 0)."""
-    try:
-        group = await _coc_safe(coc_client.get_league_group, CLAN_TAG)
-    except (coc.NotFound, Exception):
-        return None, None, 0
-
-    round_num = len(group.rounds)
-    try:
-        async for war in group.get_wars(war_round):
-            clan_tag_clean = CLAN_TAG.lstrip("#").upper()
-            if (war.clan.tag.lstrip("#").upper() == clan_tag_clean
-                    or war.opponent.tag.lstrip("#").upper() == clan_tag_clean):
-                return war, group, round_num
-    except Exception:
-        pass
-    return None, group, round_num
-
-
-async def build_cwl_message() -> tuple[str, bool]:
-    """Build CWL status message. Returns (text, keep_updating)."""
-    war, group, round_num = await get_cwl_clan_war()
-
-    if group is None:
-        return "🏳️ Клан не участвует в Лиге войн клана.", False
-
-    if war is None or group.state == "preparation":
-        return f"⚙️ ЛВК — идёт подготовка. Раундов сыграно: {round_num}.", False
-
-    if group.state == "ended":
-        return "🏁 Сезон Лиги войн клана завершён.", False
-
-    clan_tag_clean = CLAN_TAG.lstrip("#").upper()
-    our_side = war.clan if war.clan.tag.lstrip("#").upper() == clan_tag_clean else war.opponent
-    opp_side = war.opponent if our_side is war.clan else war.clan
-
-    attacks_per_member = 1
-    pending = []
-    for member in our_side.members:
-        used = len(member.attacks) if member.attacks else 0
-        if used < attacks_per_member:
-            pending.append(member)
-
-    state_label = "⚔️ ЛВК идёт" if group.state == "inWar" else "🏁 ЛВК раунд завершён"
-    our_stars = our_side.stars
-    their_stars = opp_side.stars
-
-    time_str = ""
-    if group.state == "inWar" and war.end_time:
-        now = datetime.utcnow()
-        diff = war.end_time.time - now
-        total_sec = max(int(diff.total_seconds()), 0)
-        h, m = divmod(total_sec // 60, 60)
-        time_str = f"\n⏱ До конца раунда: <b>{h}ч {m}мин</b>"
-
-    lines = [
-        f"<b>{state_label} — Раунд {round_num}</b>",
-        fmt.DIV,
-        f"🏰 <b>{our_side.name}</b>  ⚔️  <b>{opp_side.name}</b>",
-        f"⭐ {our_stars}  vs  {their_stars}" + time_str,
-    ]
-
-    if not pending:
-        lines.append(f"\n{fmt.ok('<b>Все атаковали в раунде!</b>')}")
-    else:
-        lines.append(f"\n🔴 <b>Не атаковали — {len(pending)} чел.</b>")
-        tg_map = storage.get_tg_username_map()
-        for member in pending:
-            tg = tg_map.get(_norm_name(member.name))
-            lines.append(fmt.member_line(member.name, tg=tg))
-
-    lines.append(fmt.footer())
-    keep_updating = group.state == "inWar"
-    return "\n".join(lines), keep_updating
-
-
-async def send_cwl_start(bot, chat_id: int, war, group, round_num: int):
-    clan_tag_clean = CLAN_TAG.lstrip("#").upper()
-    our_side = war.clan if war.clan.tag.lstrip("#").upper() == clan_tag_clean else war.opponent
-    opp_side = war.opponent if our_side is war.clan else war.clan
-    opponent_name = opp_side.name if opp_side else "противника"
-
-    text = (
-        f"🏆 <b>ЛВК — РАУНД {round_num} НАЧАЛСЯ!</b>\n"
-        f"{fmt.DIV}\n\n"
-        f"🏰 <b>Warfil</b>  vs  <b>{opponent_name}</b>\n\n"
-        f"{fmt.DIVs}\n"
-        f"💥 Помните: в ЛВК только <b>1 атака</b>!\n"
-        f"▸ Выбирайте цели тщательно\n"
-        f"▸ Атакуйте с умом\n\n"
-        f"<b>Удачи бойцам Warfil! 💪</b>"
-    )
-    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=KV_BUTTONS)
-
-
-async def send_cwl_end(bot, chat_id: int, war, round_num: int):
-    clan_tag_clean = CLAN_TAG.lstrip("#").upper()
-    our_side = war.clan if war.clan.tag.lstrip("#").upper() == clan_tag_clean else war.opponent
-    opp_side = war.opponent if our_side is war.clan else war.clan
-    tg_map = storage.get_tg_username_map()
-
-    attacked = []
-    missed = []
-    for member in our_side.members:
-        used = len(member.attacks) if member.attacks else 0
-        if used >= 1:
-            attacked.append(member)
-        else:
-            missed.append(member)
-
-    our_stars = our_side.stars
-    their_stars = opp_side.stars
-    if our_stars > their_stars:
-        result_line = "🏆 <b>Победа в раунде!</b>"
-    elif our_stars < their_stars:
-        result_line = "😔 <b>Поражение в раунде.</b>"
-    else:
-        result_line = "🤝 <b>Ничья в раунде.</b>"
-
-    lines = [
-        f"🏁 <b>ЛВК — РАУНД {round_num} ЗАВЕРШЁН</b>",
-        fmt.DIV,
-        f"🏰 <b>Warfil</b>  vs  <b>{opp_side.name}</b>",
-        f"⭐ {our_stars}  vs  {their_stars}  ·  {result_line}",
-    ]
-
-    if attacked:
-        lines.append(f"\n✅ <b>Атаковали ({len(attacked)}):</b>")
-        for member in attacked:
-            tg = tg_map.get(_norm_name(member.name))
-            lines.append(fmt.member_line(member.name, tg=tg))
-        lines.append("\n🔥 <i>Молодцы! Продолжайте в том же духе!</i>")
-
-    if missed:
-        lines.append(f"\n❌ <b>Не атаковали ({len(missed)}):</b>")
-        for member in missed:
-            tg = tg_map.get(_norm_name(member.name))
-            lines.append(fmt.member_line(member.name, tg=tg))
-        lines.append(f"\n{fmt.warn('<b>Игроки без атак — кандидаты на кик!</b>')}")
-
-    # Save CWL round stats for Excel
-    # Determine current season from CWL group if possible (use YYYY-MM format)
-    try:
-        group = await _coc_safe(coc_client.get_league_group, CLAN_TAG)
-        season = group.season or "unknown"
-    except Exception:
-        season = "unknown"
-    member_stats = []
-    for m in attacked:
-        member_stats.append({"name": m.name, "attacked": True})
-    for m in missed:
-        member_stats.append({"name": m.name, "attacked": False})
-    stats_storage.save_cwl_round(
-        season=season, round_num=round_num,
-        opponent=opp_side.name,
-        our_stars=our_stars, their_stars=their_stars,
-        members=member_stats,
-    )
-
-    await bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="HTML", reply_markup=KV_BUTTONS)
-
-
-async def cwl_state_monitor(bot):
-    """Poll CWL state every 60s; send messages on round start/end transitions."""
-    saved = storage.get_cwl_state()
-    prev_state = saved.get("state") if saved else None
-    prev_round = saved.get("round_count", 0) if saved else 0
-
-    while True:
-        await asyncio.sleep(60)
-        try:
-            chat_ids = storage.get_notify_chats()
-            if not chat_ids:
-                continue
-
-            group = await _coc_safe(coc_client.get_league_group, CLAN_TAG)
-            current_state = group.state or "notInWar"
-            current_round = len(group.rounds)
-
-            # New round started (inWar AND round count increased)
-            if current_state == "inWar" and (prev_state != "inWar" or current_round != prev_round):
-                war, _, _ = await get_cwl_clan_war()
-                if war:
-                    for chat_id in chat_ids:
-                        try:
-                            await send_cwl_start(bot, chat_id, war, group, current_round)
-                        except Exception as e:
-                            logger.warning(f"cwl_watcher: ошибка отправки в {chat_id}: {e}")
-
-            # Round ended
-            elif current_state == "warEnded" and prev_state == "inWar":
-                war, _, _ = await get_cwl_clan_war(coc.WarRound.previous_war)
-                if war:
-                    for chat_id in chat_ids:
-                        try:
-                            await send_cwl_end(bot, chat_id, war, prev_round)
-                        except Exception as e:
-                            logger.warning(f"cwl_watcher: ошибка отправки в {chat_id}: {e}")
-
-            if current_state != prev_state or current_round != prev_round:
-                storage.save_cwl_state(current_state, current_round)
-                prev_state = current_state
-                prev_round = current_round
-
-        except coc.NotFound:
-            pass  # Clan not in CWL this season
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.warning(f"cwl_state_monitor: {e}")
-
-
-async def cwl_auto_broadcast(bot):
-    """Send CWL status every 2 hours during active CWL round (same as war_auto_broadcast)."""
-    while True:
-        await asyncio.sleep(7200)  # 2 часа
-        try:
-            chat_ids = storage.get_notify_chats()
-            if not chat_ids:
-                continue
-            text, keep_going = await build_cwl_message()
-            if keep_going:
-                for chat_id in chat_ids:
-                    try:
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text=text,
-                            parse_mode="HTML",
-                            reply_markup=KV_BUTTONS,
-                        )
-                    except Exception as e:
-                        logger.warning(f"cwl_auto_broadcast: ошибка отправки в {chat_id}: {e}")
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.warning(f"cwl_auto_broadcast: {e}")
-
-
-async def cwl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ Загружаю данные Лиги войн...")
-    try:
-        text, _ = await build_cwl_message()
-        await msg.edit_text(text, parse_mode="HTML", reply_markup=KV_BUTTONS)
-    except Exception as e:
-        logger.error(f"Ошибка /cwl: {e}")
-        await msg.edit_text("❌ Не удалось загрузить данные ЛВК. Попробуй позже.")
-
-
-async def testcwlstart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_feolar(update):
-        await update.message.reply_text("❌ Нет доступа.")
-        return
-    try:
-        war, group, round_num = await get_cwl_clan_war()
-        if war is None:
-            await update.message.reply_text("⚠️ Клан не в ЛВК или нет активного раунда.")
-            return
-        await send_cwl_start(context.bot, update.effective_chat.id, war, group, round_num)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-
-async def testcwlend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_feolar(update):
-        await update.message.reply_text("❌ Нет доступа.")
-        return
-    try:
-        war, group, round_num = await get_cwl_clan_war()
-        if war is None:
-            await update.message.reply_text("⚠️ Клан не в ЛВК или нет активного раунда.")
-            return
-        await send_cwl_end(context.bot, update.effective_chat.id, war, round_num)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-
-async def raid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show current capital raid status."""
-    msg = await update.message.reply_text("⏳ Загружаю данные рейдов столицы...")
-    try:
-        text, _ = await build_raid_message()
-        await msg.edit_text(text, parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"Ошибка /raid: {e}")
-        await msg.edit_text("❌ Не удалось загрузить данные рейдов. Попробуй позже.")
-
-
-async def testraidstart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test: send a raid start notification to current chat."""
-    if not _is_feolar(update):
-        await update.message.reply_text("❌ Нет доступа.")
-        return
-    try:
-        raid = await _get_current_raid()
-        if raid is None:
-            await update.message.reply_text("⚠️ Нет данных о рейдах.")
-            return
-        await send_raid_start(context.bot, update.effective_chat.id, raid)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-
-async def testraidend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test: send a raid end notification to current chat."""
-    if not _is_feolar(update):
-        await update.message.reply_text("❌ Нет доступа.")
-        return
-    try:
-        raid = await _get_current_raid()
-        if raid is None:
-            await update.message.reply_text("⚠️ Нет данных о рейдах.")
-            return
-        await send_raid_end(context.bot, update.effective_chat.id, raid)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-
-CARD_BACKGROUNDS = [
-    "card_background.png",
-    "card_bg_2.png",
-    "card_bg_3.png",
-    "card_bg_4.png",
-]
 
 async def card_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🎨 Генерирую карточку клана, подождите...")
+    msg = await fmt.reply(update.message, line("card", "Рисую карточку клана…"))
     try:
         clan = await _coc_safe(coc_client.get_clan, CLAN_TAG)
         raids = []
@@ -1843,149 +682,235 @@ async def card_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raids.append(r)
         except Exception:
             pass
-        available = [p for p in CARD_BACKGROUNDS if os.path.exists(p)]
-        bg_path = __import__("random").choice(available) if available else None
-        buf = await card_builder.build_card(clan, raids=raids, background_path=bg_path)
-        await update.message.reply_photo(
-            photo=buf,
-            caption=(
-                f"🏰 <b>{clan.name}</b>  ·  Уровень {clan.level}\n"
-                f"👥 {clan.member_count} участников  ·  "
-                f"⚔️ {clan.war_wins}П / {clan.war_losses}П"
-            ),
-            parse_mode="HTML",
-        )
+        base = os.path.dirname(os.path.abspath(__file__))
+        available = [os.path.join(base, p) for p in CARD_BACKGROUNDS if os.path.exists(os.path.join(base, p))]
+        buf = await card_builder.build_card(clan, raids=raids,
+                                            background_path=random.choice(available) if available else None)
+        caption = "\n".join([
+            f"{game_emoji.plain('clan')} <b>{esc(clan.name)}</b>, уровень {clan.level}",
+            f"{game_emoji.plain('team')} {clan.member_count} в составе",
+            f"{game_emoji.plain('war')} Побед {clan.war_wins}, поражений {clan.war_losses}",
+        ])
+        await update.message.reply_photo(photo=buf, caption=caption, parse_mode="HTML")
         await msg.delete()
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        await msg.edit_text(f"❌ Ошибка генерации карточки: {e}")
+    except Exception as exc:
+        logger.error(f"/card: {exc}", exc_info=True)
+        await fmt.edit(msg, fmt.err(f"Карточка не собралась: {esc(exc)}"))
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Чаты рассылки и диагностика (админ бота)
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def addchat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_feolar(update):
-        await update.message.reply_text("⛔ Только для администратора.")
+        await _deny(update)
         return
-    chat_id = update.effective_chat.id
-    chat_type = update.effective_chat.type
-    chat_title = update.effective_chat.title or "личка"
-    added = storage.add_notify_chat(chat_id)
-    if added:
-        await update.message.reply_text(
-            f"✅ Чат добавлен в рассылку!\n"
-            f"<b>{chat_title}</b> (ID: <code>{chat_id}</code>, тип: {chat_type})\n\n"
-            "Теперь уведомления о КВ и ЛВК будут приходить сюда.",
-            parse_mode="HTML",
-        )
+    chat = update.effective_chat
+    name = esc(chat.title or "личка")
+    if storage.add_notify_chat(chat.id):
+        await fmt.reply(update.message, "\n".join([
+            fmt.ok(f"<b>{name}</b> добавлен в рассылку"),
+            "",
+            "Сюда будут приходить старт и итоги войны, раунды ЛВК, рейды столицы и напоминания.",
+            f"ID чата: <code>{chat.id}</code>",
+        ]))
     else:
-        await update.message.reply_text(
-            f"ℹ️ Этот чат уже в списке рассылки.\n"
-            f"ID: <code>{chat_id}</code>",
-            parse_mode="HTML",
-        )
+        await fmt.reply(update.message, fmt.line("chat", f"<b>{name}</b> уже в рассылке. ID: <code>{chat.id}</code>"))
 
 
 async def removechat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_feolar(update):
-        await update.message.reply_text("⛔ Только для администратора.")
+        await _deny(update)
         return
-    chat_id = update.effective_chat.id
-    chat_title = update.effective_chat.title or "личка"
-    removed = storage.remove_notify_chat(chat_id)
-    if removed:
-        await update.message.reply_text(
-            f"✅ Чат удалён из рассылки.\n"
-            f"<b>{chat_title}</b> (ID: <code>{chat_id}</code>)",
-            parse_mode="HTML",
-        )
+    chat = update.effective_chat
+    name = esc(chat.title or "личка")
+    if storage.remove_notify_chat(chat.id):
+        await fmt.reply(update.message, fmt.ok(f"<b>{name}</b> больше не получает уведомления."))
     else:
-        await update.message.reply_text(
-            f"ℹ️ Этот чат не был в списке рассылки.\n"
-            f"ID: <code>{chat_id}</code>",
-            parse_mode="HTML",
-        )
+        await fmt.reply(update.message, fmt.warn(f"<b>{name}</b> и так не в рассылке."))
 
 
 async def listchats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_feolar(update):
-        await update.message.reply_text("⛔ Только для администратора.")
+        await _deny(update)
         return
     chats = storage.get_notify_chats()
     if not chats:
-        await update.message.reply_text("📭 Список чатов для рассылки пуст.")
+        await fmt.reply(update.message, fmt.warn(
+            "Рассылка пустая — уведомления никуда не уходят. Отправь /addchat в беседе клана."))
         return
-    lines = [f"📬 <b>Чаты для рассылки ({len(chats)}):</b>"]
-    for i, cid in enumerate(chats, 1):
-        lines.append(f"  {i}. <code>{cid}</code>")
-    lines.append("\nℹ️ /addchat — добавить текущий чат\n/removechat — убрать текущий чат")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-async def _detect_real_outbound_ip() -> str | None:
-    """Определяем реальный исходящий IP сервера через внешний сервис."""
-    import aiohttp
-    for url in ("https://api.ipify.org", "https://checkip.amazonaws.com", "https://icanhazip.com"):
+    rows = []
+    for cid in chats:
         try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
-                    ip = (await r.text()).strip()
-                    if _re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
-                        return ip
-        except Exception:
-            continue
-    return None
+            c = await context.bot.get_chat(cid)
+            rows.append(f"<b>{esc(c.title or c.full_name or 'личка')}</b>  <code>{cid}</code>")
+        except Exception as exc:
+            rows.append(f"<code>{cid}</code>  {e('warn')} бот не видит чат: {esc(exc)}")
+    await fmt.reply(update.message, f"{title('chat', f'Чаты рассылки: {len(chats)}')}\n{quote(rows, 20)}")
 
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_feolar(update):
+        await _deny(update)
+        return
+    await fmt.reply(update.message, notifier.status_text())
+
+
+async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Прогнать все мониторы прямо сейчас."""
+    if not _is_feolar(update):
+        await _deny(update)
+        return
+    msg = await fmt.reply(update.message, line("time", "Проверяю войну, ЛВК и рейды…"))
+    for name, tick in (("war", notifier.war_tick), ("cwl", notifier.cwl_tick), ("raid", notifier.raid_tick)):
+        h = notifier._h(name)
+        try:
+            await asyncio.wait_for(tick(context.bot), timeout=notifier.TICK_TIMEOUT)
+            h["last_ok"] = fmt.utcnow()
+        except Exception as exc:
+            h["last_error"] = f"{type(exc).__name__}: {exc}"
+            h["last_error_at"] = fmt.utcnow()
+    await fmt.edit(msg, notifier.status_text())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Игровые эмодзи (админ бота)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def emoji_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_feolar(update):
+        await _deny(update)
+        return
+    mapped = game_emoji.mapped()
+    rows = [f"{e(k)} <code>{k}</code> — {desc}{'' if k in mapped else ' · обычный'}"
+            for k, (_, desc) in game_emoji.KEYS.items()]
+    note = ("Кастомные эмодзи включены." if game_emoji.custom_enabled else
+            fmt.warn("Telegram не принял кастомные эмодзи — нужен Telegram Premium у владельца бота. "
+                     "Сейчас показываются обычные."))
+    await fmt.reply(update.message, "\n".join([
+        title("admin", f"Игровые эмодзи: {len(mapped)} из {len(game_emoji.KEYS)}"),
+        note,
+        quote(rows, fold_after=12),
+        "",
+        "Подтянуть пак: <code>/emojipack https://t.me/addemoji/имя</code>",
+        "Вручную: <code>/setemoji war ⚔️ star ⭐</code> — вместо обычных вставь эмодзи из пака.",
+        "Сбросить: /emojireset",
+    ]))
+
+
+async def emojipack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_feolar(update):
+        await _deny(update)
+        return
+    name = game_emoji.pack_name_from(_args(update))
+    if not name:
+        await fmt.reply(update.message, "Пришли ссылку на пак: <code>/emojipack https://t.me/addemoji/имя</code>")
+        return
+    try:
+        pack = await context.bot.get_sticker_set(name)
+    except Exception as exc:
+        await fmt.reply(update.message, fmt.err(f"Пак <code>{esc(name)}</code> не найден: {esc(exc)}"))
+        return
+    found = game_emoji.auto_map_stickers(pack.stickers, overwrite=True)
+    if found:
+        game_emoji.set_many(found)
+    missing = [k for k in game_emoji.KEYS if k not in game_emoji.mapped()]
+    lines = [
+        fmt.ok(f"Пак <b>{esc(pack.title)}</b>: {len(pack.stickers)} эмодзи, сопоставлено {len(found)}"),
+    ]
+    if found:
+        lines.append(" ".join(e(k) for k in found))
+    if missing:
+        lines.append("\nБез пары остались: " + ", ".join(f"<code>{k}</code>" for k in missing))
+        lines.append("Их можно задать вручную: <code>/setemoji ключ эмодзи</code>")
+    await fmt.reply(update.message, "\n".join(lines))
+
+
+async def setemoji_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setemoji war <кастомный эмодзи> star <кастомный эмодзи> ..."""
+    if not _is_feolar(update):
+        await _deny(update)
+        return
+    msg = update.message
+    text = msg.text or ""
+    utf16 = text.encode("utf-16-le")
+
+    def cut(a: int, b: int) -> str:
+        return utf16[a * 2:b * 2].decode("utf-16-le")
+
+    pairs, pos = {}, 0
+    ents = sorted([x for x in (msg.entities or []) if x.type == MessageEntity.CUSTOM_EMOJI],
+                  key=lambda x: x.offset)
+    for ent in ents:
+        words = cut(pos, ent.offset).split()
+        key = next((w.lower() for w in reversed(words) if w.lower() in game_emoji.KEYS), None)
+        if key:
+            pairs[key] = ent.custom_emoji_id
+        pos = ent.offset + ent.length
+    if not pairs:
+        await fmt.reply(msg, "\n".join([
+            "Не нашёл пар «ключ + кастомный эмодзи».",
+            "Пример: <code>/setemoji war</code> ⚔️ <code>star</code> ⭐ — эмодзи вставь из пака.",
+            "Список ключей — /emoji",
+        ]))
+        return
+    game_emoji.set_many(pairs)
+    await fmt.reply(msg, fmt.ok("Сохранил: " + "  ".join(f"{e(k)} <code>{k}</code>" for k in pairs)))
+
+
+async def emojireset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_feolar(update):
+        await _deny(update)
+        return
+    game_emoji.reset()
+    await fmt.reply(update.message, fmt.ok("Вернул обычные эмодзи."))
+
+
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "📋 Список клана":
+        await team_command(update, context)
+    elif text == "❓ Помощь":
+        await help_command(update, context)
+    elif text == "🔗 Привязать аккаунт":
+        await fmt.reply(update.message, "Напиши ник из игры после команды: <code>/register WarriorKing</code>")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Запуск
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def post_init(application):
-    if COC_API_KEY:
-        await coc_client.login_with_tokens(COC_API_KEY)
-        logger.info("CoC клиент авторизован через API ключ")
-    else:
-        # 1) Определяем реальный исходящий IP сервера
-        real_ip = await _detect_real_outbound_ip()
-        if real_ip:
-            logger.info(f"Реальный исходящий IP сервера: {real_ip}")
-            # _rekey_coc ниже вызовет _register_ip(real_ip) сам — дублировать не нужно
-        else:
-            logger.warning("Не удалось определить исходящий IP")
+    await coc_api.login()
 
-        # 2) Создаём/обновляем ключ с CIDR диапазоном (/24) для каждого известного IP
-        #    _rekey_coc делает login_with_tokens внутри — НЕ вызываем coc_client.login()
-        #    чтобы coc.py не удалил наш CIDR-ключ (coc.py умеет только точное IP сравнение)
-        ok = await _rekey_coc(new_ip=real_ip)
-        if ok:
-            logger.info("CoC клиент авторизован через CIDR-ключ (email/пароль)")
-        else:
-            # Fallback: обычный логин через coc.py
-            logger.warning("_rekey_coc не удался — обычный логин через coc.py")
-            await coc_client.login(COC_EMAIL, COC_PASSWORD)
-            logger.info("CoC клиент авторизован через email/пароль (fallback)")
+    if config.EMOJI_PACK and not game_emoji.mapped():
+        try:
+            pack = await application.bot.get_sticker_set(game_emoji.pack_name_from(config.EMOJI_PACK))
+            found = game_emoji.auto_map_stickers(pack.stickers)
+            if found:
+                game_emoji.set_many(found)
+            logger.info(f"Эмодзи-пак {pack.name}: сопоставлено {len(found)}")
+        except Exception as exc:
+            logger.warning(f"Эмодзи-пак {config.EMOJI_PACK}: {exc}")
 
-    asyncio.create_task(war_auto_broadcast(application.bot))
-    asyncio.create_task(war_state_monitor(application.bot))
-    asyncio.create_task(cwl_state_monitor(application.bot))
-    asyncio.create_task(cwl_auto_broadcast(application.bot))
-    asyncio.create_task(raid_state_monitor(application.bot))
-    asyncio.create_task(raid_auto_broadcast(application.bot))
-    logger.info("Авто-рассылка войны, ЛВК и рейдов запущена")
+    chats = storage.get_notify_chats()
+    logger.info(f"Папка данных: {storage.DATA_DIR}; чатов рассылки: {len(chats)}")
+    if not chats:
+        logger.warning("Список чатов рассылки пуст! Отправь /addchat в беседе клана.")
 
-    # Register bot commands (shown in Telegram command menu)
+    notifier.start(application.bot)
+
     await application.bot.set_my_commands([
-        BotCommand("start",    "🏰 Главное меню"),
-        BotCommand("team",     "📋 Список участников клана"),
-        BotCommand("kv",       "⚔️ Атаки в клановой войне"),
-        BotCommand("cwl",      "🏆 Статус Лиги войн клана"),
-        BotCommand("raid",     "🏛 Рейды столицы клана"),
-        BotCommand("statistic","📊 Статистика клана (Excel)"),
-        BotCommand("card",     "🎨 Карточка клана"),
-        BotCommand("register", "🔗 Привязать свой аккаунт CoC"),
-        BotCommand("help",     "❓ Помощь по командам"),
-        BotCommand("link",       "🛡 [Адм] Привязать игрока к Telegram"),
-        BotCommand("unlink",     "🛡 [Адм] Убрать привязку игрока"),
-        BotCommand("links",      "🛡 [Адм] Список всех привязок"),
-        BotCommand("addchat",    "🛡 [Адм] Добавить чат в рассылку"),
-        BotCommand("removechat", "🛡 [Адм] Убрать чат из рассылки"),
-        BotCommand("listchats",  "🛡 [Адм] Список чатов рассылки"),
+        BotCommand("kv",        "Атаки в текущей войне"),
+        BotCommand("cwl",       "Лига войн кланов"),
+        BotCommand("raid",      "Рейды столицы"),
+        BotCommand("team",      "Состав клана"),
+        BotCommand("statistic", "Статистика в Excel"),
+        BotCommand("card",      "Карточка клана"),
+        BotCommand("register",  "Привязать свой аккаунт"),
+        BotCommand("help",      "Все команды"),
+        BotCommand("start",     "О клане"),
     ])
     await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     logger.info("Команды бота зарегистрированы")
@@ -1999,12 +924,12 @@ async def post_shutdown(application):
         pass
 
 
-async def conflict_error_handler(update, context):
+async def error_handler(update, context):
     from telegram.error import Conflict
     if isinstance(context.error, Conflict):
-        logger.warning("Конфликт: другой экземпляр бота работает. Жду освобождения...")
+        logger.warning("Конфликт: запущен второй экземпляр бота с тем же токеном.")
     else:
-        logger.error(f"Ошибка: {context.error}")
+        logger.error(f"Ошибка: {context.error}", exc_info=context.error)
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -2019,9 +944,12 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
 def _start_health_server():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    try:
+        server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    except OSError as exc:
+        logger.warning(f"Health-сервер на порту {port} не запущен: {exc}")
+        return
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     logger.info(f"Health check server listening on port {port}")
 
 
@@ -2034,34 +962,26 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
-
-    # Защита: проверяется ДО всех команд
     app.add_handler(TypeHandler(Update, clan_guard), group=-1)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("team", team_command))
-    app.add_handler(CommandHandler("register", register_command))
-    app.add_handler(CommandHandler("online", online_command))
-    app.add_handler(CommandHandler("kv", kv_command))
-    app.add_handler(CommandHandler("link", link_command))
-    app.add_handler(CommandHandler("unlink", unlink_command))
-    app.add_handler(CommandHandler("links", links_command))
-    app.add_handler(CommandHandler("teststart", teststart_command))
-    app.add_handler(CommandHandler("testend", testend_command))
-    app.add_handler(CommandHandler("cwl", cwl_command))
-    app.add_handler(CommandHandler("raid", raid_command))
-    app.add_handler(CommandHandler("statistic", statistic_command))
-    app.add_handler(CommandHandler("testcwlstart", testcwlstart_command))
-    app.add_handler(CommandHandler("testcwlend", testcwlend_command))
-    app.add_handler(CommandHandler("testraidstart", testraidstart_command))
-    app.add_handler(CommandHandler("testraidend", testraidend_command))
-    app.add_handler(CommandHandler("card", card_command))
-    app.add_handler(CommandHandler("addchat", addchat_command))
-    app.add_handler(CommandHandler("removechat", removechat_command))
-    app.add_handler(CommandHandler("listchats", listchats_command))
+    for name, fn in [
+        ("start", start), ("help", help_command), ("team", team_command),
+        ("register", register_command), ("online", online_command),
+        ("kv", kv_command), ("cwl", cwl_command), ("raid", raid_command),
+        ("statistic", statistic_command), ("card", card_command),
+        ("link", link_command), ("unlink", unlink_command), ("links", links_command),
+        ("addchat", addchat_command), ("removechat", removechat_command),
+        ("listchats", listchats_command), ("status", status_command), ("check", check_command),
+        ("emoji", emoji_command), ("emojipack", emojipack_command),
+        ("setemoji", setemoji_command), ("emojireset", emojireset_command),
+        ("teststart", teststart_command), ("testend", testend_command),
+        ("testremind", testremind_command),
+        ("testcwlstart", testcwlstart_command), ("testcwlend", testcwlend_command),
+        ("testraidstart", testraidstart_command), ("testraidend", testraidend_command),
+    ]:
+        app.add_handler(CommandHandler(name, fn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
-    app.add_error_handler(conflict_error_handler)
+    app.add_error_handler(error_handler)
 
     logger.info("Бот запущен...")
     app.run_polling()

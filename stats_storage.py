@@ -1,21 +1,8 @@
 import json
 import os
 
-import pathlib
 
-def _data_dir() -> pathlib.Path:
-    p = pathlib.Path("/data")
-    try:
-        p.mkdir(exist_ok=True)
-        (p / ".writable_check").touch()
-        (p / ".writable_check").unlink()
-        return p
-    except OSError:
-        local = pathlib.Path("data")
-        local.mkdir(exist_ok=True)
-        return local
-
-_DIR = _data_dir()
+from storage import _DIR  # общая папка данных
 
 WAR_HISTORY_FILE = str(_DIR / "war_history.json")
 CWL_HISTORY_FILE = str(_DIR / "cwl_history.json")
